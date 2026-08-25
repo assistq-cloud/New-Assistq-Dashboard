@@ -51,14 +51,34 @@ async function ensureTable() {
 // from Postgres, creating the row with defaultStore if this is a fresh DB.
 export async function initDB(defaultStore) {
   const url = connectionString();
-  const isLocal = /localhost|127\.0\.0\.1/.test(url);
-  pool = new Pool({
-    connectionString: url,
-    // Railway/Render's managed Postgres requires SSL; this accepts their
-    // self-signed chain without failing the handshake. Local Postgres
-    // (development) usually has SSL off entirely, so skip it there.
-    ssl: isLocal ? false : { rejectUnauthorized: false },
-  });
+  // Local dev Postgres, and Railway's own *internal* Postgres hostname
+  // (postgres.railway.internal, used when app + DB are linked in the same
+  // project) both run without SSL. Public/external hosts (Render, Supabase,
+  // Railway's public proxy host, etc.) require it. Rather than guess wrong
+  // and crash-loop the app, try SSL first, then fall back automatically.
+  const looksInternal = /localhost|127\.0\.0\.1|\.railway\.internal/.test(url);
+  const attempts = looksInternal
+    ? [false, { rejectUnauthorized: false }]
+    : [{ rejectUnauthorized: false }, false];
+
+  let lastErr;
+  for (const ssl of attempts) {
+    const candidate = new Pool({ connectionString: url, ssl });
+    try {
+      await candidate.query("SELECT 1");
+      pool = candidate;
+      console.log(`ASSISTQ: connected to Postgres (ssl=${ssl ? "on" : "off"}).`);
+      break;
+    } catch (err) {
+      lastErr = err;
+      await candidate.end().catch(() => {});
+    }
+  }
+  if (!pool) {
+    throw new Error(
+      `Could not connect to Postgres with or without SSL. Last error: ${lastErr?.message}`
+    );
+  }
 
   await ensureTable();
 
