@@ -1,0 +1,206 @@
+{
+  "meta_lead_ads": {
+    "purpose": "Receive Meta lead-form events and normalize them into AssistQ leads.",
+    "required_env": [
+      "META_VERIFY_TOKEN",
+      "META_APP_SECRET"
+    ],
+    "normalized_event": [
+      "external_lead_id",
+      "page_id",
+      "form_id",
+      "campaign_id",
+      "adset_id",
+      "ad_id",
+      "created_at",
+      "fields",
+      "raw_event"
+    ],
+    "security": [
+      "Verify webhook challenge",
+      "Verify request signature",
+      "Deduplicate by external_lead_id"
+    ]
+  },
+  "google_ads": {
+    "purpose": "Import campaign/ad spend and join it to UTM/campaign attribution.",
+    "required_env": [
+      "GOOGLE_ADS_DEVELOPER_TOKEN",
+      "GOOGLE_ADS_CLIENT_ID",
+      "GOOGLE_ADS_CLIENT_SECRET",
+      "GOOGLE_ADS_REFRESH_TOKEN",
+      "GOOGLE_ADS_CUSTOMER_ID"
+    ],
+    "metrics": [
+      "spend",
+      "clicks",
+      "impressions",
+      "conversions",
+      "campaign_id",
+      "date"
+    ],
+    "derived_metrics": [
+      "CPL",
+      "CPQL",
+      "CPSV",
+      "CPB"
+    ]
+  },
+  "calendar": {
+    "purpose": "Schedule site visits and virtual consultations.",
+    "required_env": [
+      "CALENDAR_PROVIDER",
+      "CALENDAR_CLIENT_ID",
+      "CALENDAR_CLIENT_SECRET"
+    ],
+    "workflow": [
+      "Create slot",
+      "Reserve slot",
+      "Send confirmation",
+      "Create reminder jobs",
+      "Cancel/reschedule"
+    ]
+  },
+  "whatsapp": {
+    "purpose": "Automate approved WhatsApp template messages and inbound events.",
+    "required_env": [
+      "WA_PHONE_NUMBER_ID",
+      "WA_ACCESS_TOKEN",
+      "WA_VERIFY_TOKEN",
+      "WA_APP_SECRET",
+      "WA_API_VERSION"
+    ],
+    "workflow": [
+      "Lead received",
+      "Approved template",
+      "Qualification",
+      "Site-visit invite",
+      "Reminder",
+      "Post-visit follow-up"
+    ],
+    "security": [
+      "Never commit tokens",
+      "Verify webhook signature",
+      "Log message IDs",
+      "Idempotency"
+    ]
+  },
+  "followups": {
+    "purpose": "Run configurable lead nurture sequences.",
+    "sequence_examples": [
+      "Lead received: immediate acknowledgement",
+      "No response: 15 min escalation",
+      "Site visit tomorrow: 24 h reminder",
+      "Site visit today: 2 h reminder",
+      "Post visit: same-day thank you",
+      "Post visit: day 2 follow-up",
+      "Post visit: day 7 follow-up",
+      "Dormant lead: day 30 reactivation"
+    ]
+  },
+  "inventory_matching": {
+    "purpose": "Match qualified leads to currently available units/projects.",
+    "signals": [
+      "location",
+      "property_type",
+      "budget_min",
+      "budget_max",
+      "bedrooms",
+      "possession",
+      "purpose",
+      "amenities"
+    ],
+    "rules": [
+      "Never recommend booked/inactive inventory",
+      "Show match score and reasons",
+      "Allow sales override"
+    ]
+  },
+  "nri": {
+    "purpose": "Support remote buyers and virtual consultations.",
+    "signals": [
+      "country",
+      "timezone",
+      "purchase_purpose",
+      "India_visit_date"
+    ],
+    "actions": [
+      "Virtual consultation",
+      "Video tour link",
+      "Callback slot",
+      "India visit scheduling"
+    ]
+  },
+  "escalation": {
+    "purpose": "Prevent uncontacted hot/qualified leads from being forgotten.",
+    "rules": [
+      "Hot lead uncontacted for configurable threshold -> salesperson alert",
+      "Still uncontacted -> manager alert",
+      "Still uncontacted -> owner/admin escalation",
+      "Record every escalation in lead activity timeline"
+    ]
+  },
+  "reports": {
+    "purpose": "Revenue-focused reporting.",
+    "funnel": [
+      "lead",
+      "qualified",
+      "contacted",
+      "site_visit_scheduled",
+      "site_visit_completed",
+      "negotiation",
+      "booking"
+    ],
+    "metrics": [
+      "CPL",
+      "CPQL",
+      "CPSV",
+      "CPB",
+      "qualification_rate",
+      "visit_rate",
+      "booking_rate",
+      "response_time"
+    ],
+    "reports": [
+      "weekly_owner",
+      "weekly_sales_manager",
+      "campaign_roi",
+      "project_performance",
+      "salesperson_performance"
+    ]
+  },
+  "channel_partners": {
+    "purpose": "Track broker/channel-partner sourced leads and outcomes.",
+    "fields": [
+      "partner_name",
+      "contact",
+      "lead_owner",
+      "project",
+      "site_visits",
+      "bookings",
+      "commission_status"
+    ],
+    "permissions": [
+      "partner sees own leads/outcomes",
+      "client admin sees all"
+    ]
+  },
+  "portal_adapters": {
+    "purpose": "Provider-neutral ingestion for property portal leads where official API/email/webhook access is available.",
+    "dedupe_key": [
+      "provider",
+      "external_lead_id"
+    ],
+    "note": "Do not scrape or bypass provider restrictions; use authorized integrations/imports."
+  },
+  "rera_qa": {
+    "purpose": "Marketing-material QA checklist for Maharashtra real-estate promotions.",
+    "checks": [
+      "RERA registration reference present",
+      "QR code reference present",
+      "project website reference present",
+      "visibility/readability review"
+    ],
+    "disclaimer": "QA checklist only; not legal advice or a regulatory compliance guarantee."
+  }
+}
