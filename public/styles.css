@@ -32,7 +32,9 @@ button,input,select,textarea{font:inherit}
 .brand small{display:block;color:var(--muted);font-size:9px;margin-top:3px;font-family:var(--mono);letter-spacing:.3px}
 .mark{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(135deg,var(--a2),var(--a));font-family:var(--serif);font-weight:700;color:#150f04;flex-shrink:0}
 .company{font-size:9px;letter-spacing:1.4px;padding:6px 11px 16px;color:var(--muted);font-family:var(--mono)}
-nav{display:flex;flex-direction:column;gap:2px}
+nav{display:flex;flex-direction:column;gap:2px;flex:1 1 auto;overflow-y:auto;overflow-x:hidden;min-height:0;scrollbar-width:thin;scrollbar-color:var(--cardBorder) transparent}
+nav::-webkit-scrollbar{width:6px}
+nav::-webkit-scrollbar-thumb{background:var(--cardBorder);border-radius:10px}
 .nav{border:0;background:transparent;color:var(--muted);padding:11px 12px;border-radius:10px;text-align:left;cursor:pointer;font-size:12.5px;display:flex;gap:11px;align-items:center;transition:background .15s ease,color .15s ease}
 .nav:hover{background:rgba(255,255,255,0.04);color:var(--text)}
 .nav.active{background:var(--asoft);color:var(--a2)}
