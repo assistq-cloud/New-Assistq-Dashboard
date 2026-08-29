@@ -6,6 +6,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import nodemailer from "nodemailer";
+import Razorpay from "razorpay";
 import { initDB, readStore, writeStore } from "./db.js";
 
 dotenv.config();
@@ -153,7 +154,9 @@ app.post("/api/auth/login",rateLimit("login",10,60000),(req,res)=>{
   const s=ensureStoreShape(readStore());
   if(email===adminEmail&&checkAdminPassword(password,s)){req.session.user={role:"admin",email};return res.json({ok:true,user:req.session.user});}
   const c=s.clients.find(x=>x.reportEmail?.toLowerCase()===email&&x.accessCode===password);
-  if(c){const sub=subscriptionInfo(c);if(!sub.active)return res.status(403).json({error:`This client account is ${sub.status}. Please contact ASSISTQ to renew the subscription.`,subscription:sub});req.session.user={role:"client",email,clientId:c.id,name:c.name};return res.json({ok:true,user:req.session.user});}
+  if(c){const sub=subscriptionInfo(c);if(!sub.active)return res.status(403).json({error:`This client account is ${sub.status}. Please contact ASSISTQ to renew the subscription.`,subscription:sub});
+    if(String(c.plan||"Starter").toLowerCase().trim()==="starter")return res.status(403).json({error:"Your Starter plan doesn't include dashboard access — your leads are sent to you directly by WhatsApp/email. Upgrade to Growth or Premium to unlock the dashboard.",plan:c.plan});
+    req.session.user={role:"client",email,clientId:c.id,name:c.name};return res.json({ok:true,user:req.session.user});}
   res.status(401).json({error:"Invalid email or password"});
 });
 app.post("/api/auth/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
@@ -170,6 +173,110 @@ app.post("/api/auth/change-password",requireAuth,rateLimit("change-password",5,6
 
 // Public, non-secret client configuration for embeddable chatbot.
 app.get("/api/public/client-config",rateLimit("public-config",120,60000),(req,res)=>{const s=ensureStoreShape(readStore());const id=normaliseClientId(req.query.clientId||s.settings.clientId);const c=s.clients.find(x=>x.id===id);if(!c)return res.status(404).json({error:"Client not found"});const sub=subscriptionInfo(c);if(!sub.active)return res.status(403).json({error:`Client subscription is ${sub.status}.`,subscription:sub});const profile=s.clientProfiles[id]||{};const cs=clientSettings(s,id);res.setHeader("Cache-Control","no-store");res.json({clientId:id,businessName:c.name,website:c.website,reportEmail:c.reportEmail||"",clientWhatsApp:cs.clientWhatsApp||"",whatsappCountryCode:cs.whatsappCountryCode||"91",subscription:sub,assistant:profile.assistant||cs.assistant||defaultStore.settings.assistant,customLeadFields:profile.customLeadFields||cs.customLeadFields||[]});});
+
+// ---------- Billing (Razorpay) ----------
+// Pricing lives here in one place so the backend, not the browser, is the
+// source of truth for what each plan actually costs — the checkout page
+// only ever tells us WHICH plan the customer picked, never the amount.
+const PLAN_CATALOG = {
+  starter: { razorpayPlanEnv: "RAZORPAY_PLAN_STARTER", setup: 1999, monthly: 999, trial: true, label: "Starter" },
+  growth: { razorpayPlanEnv: "RAZORPAY_PLAN_GROWTH", setup: 2999, monthly: 3499, trial: false, label: "Growth" },
+  premium: { razorpayPlanEnv: "RAZORPAY_PLAN_PREMIUM", setup: 4999, monthly: 6999, trial: false, label: "Premium" }
+};
+const WEBSITE_CHARGE = 2999;
+const TRIAL_DAYS = 15;
+const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET }) : null;
+
+app.post("/api/billing/create-subscription", rateLimit("billing-create", 20, 60000), async (req, res) => {
+  if (!razorpay) return res.status(501).json({ error: "Payments aren't configured yet — set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET." });
+  const planKey = String(req.body.plan || "").toLowerCase();
+  const plan = PLAN_CATALOG[planKey];
+  if (!plan) return res.status(400).json({ error: "Unknown plan." });
+  const razorpayPlanId = process.env[plan.razorpayPlanEnv];
+  if (!razorpayPlanId) return res.status(501).json({ error: `Payments aren't fully configured yet — set ${plan.razorpayPlanEnv} to this plan's Razorpay Plan ID.` });
+  const customer = req.body.customer || {};
+  const fullName = String(customer.fullName || "").trim();
+  const email = String(customer.email || "").trim().toLowerCase();
+  const phone = String(customer.phone || "").trim();
+  const businessName = String(customer.businessName || fullName || "").trim();
+  if (!fullName || !email || !phone) return res.status(400).json({ error: "Name, email and phone are required." });
+  const noWebsite = !!req.body.noWebsite;
+  const isTrial = !!plan.trial; // only Starter is ever a trial — this is decided by the plan, not the browser
+
+  try {
+    const addons = [{ item: { name: `${plan.label} — one-time setup`, amount: plan.setup * 100, currency: "INR" } }];
+    if (noWebsite) addons.push({ item: { name: "Landing page (no existing website)", amount: WEBSITE_CHARGE * 100, currency: "INR" } });
+
+    const subPayload = {
+      plan_id: razorpayPlanId,
+      customer_notify: 1,
+      total_count: 360, // effectively open-ended monthly billing (30 years); cancel anytime via dashboard/API
+      addons,
+      notes: { businessName, fullName, email, phone, plan: planKey, noWebsite: String(noWebsite) }
+    };
+    // TRIAL LOGIC: only Starter defers its first recurring charge. Setting
+    // start_at pushes the first plan invoice out by TRIAL_DAYS; the addons
+    // above (setup fee, +website charge) still bill immediately regardless,
+    // since those aren't part of the trial.
+    if (isTrial) subPayload.start_at = Math.floor(Date.now() / 1000) + TRIAL_DAYS * 86400;
+
+    const subscription = await razorpay.subscriptions.create(subPayload);
+    res.json({ subscription_id: subscription.id, key_id: process.env.RAZORPAY_KEY_ID });
+  } catch (err) {
+    res.status(502).json({ error: "Razorpay couldn't create the subscription: " + (err?.error?.description || err.message) });
+  }
+});
+
+app.post("/api/billing/verify", rateLimit("billing-verify", 20, 60000), async (req, res) => {
+  if (!razorpay) return res.status(501).json({ error: "Payments aren't configured yet." });
+  const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature } = req.body || {};
+  if (!razorpay_payment_id || !razorpay_subscription_id || !razorpay_signature) return res.status(400).json({ error: "Missing payment verification fields." });
+
+  const expected = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET).update(`${razorpay_payment_id}|${razorpay_subscription_id}`).digest("hex");
+  if (expected !== razorpay_signature) return res.status(400).json({ error: "Payment signature didn't match — this payment could not be verified." });
+
+  try {
+    const subscription = await razorpay.subscriptions.fetch(razorpay_subscription_id);
+    const notes = subscription.notes || {};
+    const planKey = String(notes.plan || "").toLowerCase();
+    const plan = PLAN_CATALOG[planKey];
+    if (!plan) return res.status(400).json({ error: "Subscription has no recognised plan in its notes." });
+
+    const s = ensureStoreShape(readStore());
+    let id = normaliseClientId(notes.businessName || notes.fullName || "client");
+    if (s.clients.some(x => x.id === id)) id = id + "-" + crypto.randomBytes(2).toString("hex");
+    const accessCode = crypto.randomBytes(5).toString("hex").toUpperCase();
+    const c = {
+      id, name: String(notes.businessName || notes.fullName), website: "",
+      reportEmail: String(notes.email || ""), clientWhatsApp: String(notes.phone || ""),
+      accessCode, plan: plan.label, subscriptionStatus: "active",
+      subscriptionStart: new Date().toISOString(), subscriptionEnd: null,
+      razorpaySubscriptionId: razorpay_subscription_id
+    };
+    s.clients.push(c);
+    writeStore(s);
+
+    // Best-effort welcome email — payment is already verified and the
+    // account already exists either way, so a failed email here should
+    // never fail the checkout for the customer.
+    try {
+      if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+        const transporter = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: Number(process.env.SMTP_PORT || 587) === 465, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } });
+        const loginUrl = process.env.APP_BASE_URL || "https://app.assistq.in";
+        const dashboardLine = plan.label === "Starter" ? "Your plan doesn't include dashboard access — your leads will be sent to you directly by WhatsApp and email." : `You can log in to your dashboard any time at <a href="${loginUrl}">${loginUrl}</a>.`;
+        await transporter.sendMail({
+          from: process.env.REPORT_FROM || process.env.SMTP_USER, to: c.reportEmail,
+          subject: `Welcome to AssistQ — your ${plan.label} plan is live`,
+          html: `<h2>Welcome to AssistQ, ${escapeHtml(notes.fullName || "")}!</h2><p>Your <b>${plan.label}</b> plan is now active for <b>${escapeHtml(c.name)}</b>.</p><p>${dashboardLine}</p><p><b>Login email:</b> ${escapeHtml(c.reportEmail)}<br><b>Access code:</b> ${accessCode}</p><p>Keep this email — you'll need the access code to log in.</p>`
+        });
+      }
+    } catch (mailErr) { /* email is best-effort; the account is already created either way */ }
+
+    res.json({ ok: true, clientId: id, accessCode, plan: plan.label });
+  } catch (err) {
+    res.status(502).json({ error: "Couldn't finish setting up the account: " + (err?.error?.description || err.message) });
+  }
+});
 
 // ---------- State ----------
 app.get("/api/state",requireAuth,(req,res)=>{
