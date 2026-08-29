@@ -236,13 +236,24 @@ function addMessage(sender, text) {
   return div;
 }
 
+const RENT_BUDGET_OPTIONS = ["Under ₹20k/mo", "₹20k–40k/mo", "₹40k–80k/mo", "₹80k+/mo"];
+function optionsFor(q) {
+  // The "budget" question means very different things for a renter vs a buyer —
+  // once we know which, swap in the matching range instead of always showing
+  // purchase-price buckets.
+  if (q.key === "budget" && String(knownFields.purpose || "").toLowerCase().includes("rent")) {
+    return RENT_BUDGET_OPTIONS;
+  }
+  return q.options;
+}
 function showOptionsIfAny() {
   optionsContainer.innerHTML = "";
   const nextQ = CONFIG.questions.find(q => !knownFields[q.key]);
-  if (!nextQ || !nextQ.options || !nextQ.options.length) return;
+  const opts = nextQ ? optionsFor(nextQ) : null;
+  if (!nextQ || !opts || !opts.length) return;
   const row = document.createElement("div");
   row.className = "optionsRow";
-  nextQ.options.forEach(opt => {
+  opts.forEach(opt => {
     const btn = document.createElement("button");
     btn.className = "optionBtn";
     btn.textContent = opt;
