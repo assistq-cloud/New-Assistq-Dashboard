@@ -560,8 +560,10 @@ function scrollToSection(id) {
 
 // ============ CONFIG — edit these for each client ============
 const CONFIG = {
-  webhookUrl: "https://script.google.com/macros/s/AKfycbyZddoCVD7M1bnjFzmaP_6c_JdLr6T02z-PB_KC82-G1UQDSrVr08JpTo-StU37iGBT/exec",  // must end in /exec
-  dashboardUrl: "https://assistq-growth-platform.onrender.com", // ASSISTQ Growth Platform bridge
+  // One Apps Script deployment can serve all clients. Prefer URL parameters
+  // for per-client setup so this file does not need to be edited every time.
+  webhookUrl: "https://script.google.com/macros/s/AKfycbyZddoCVD7M1bnjFzmaP_6c_JdLr6T02z-PB_KC82-G1UQDSrVr08JpTo-StU37iGBT/exec",
+  dashboardUrl: "https://assistq.in",
   clientId: "demo-realty",
   businessName: "This Business",
   greeting: "Hi! 👋 What's your name?",
@@ -592,8 +594,10 @@ const leadId = "lead_" + Date.now() + "_" + Math.random().toString(36).slice(2, 
 const params = new URLSearchParams(window.location.search);
 const clientFromUrl = params.get("clientId");
 const dashboardFromUrl = params.get("dashboardUrl");
+const webhookFromUrl = params.get("webhookUrl");
 if (clientFromUrl) CONFIG.clientId = clientFromUrl;
 if (dashboardFromUrl) CONFIG.dashboardUrl = dashboardFromUrl.replace(/\/$/, "");
+if (webhookFromUrl) CONFIG.webhookUrl = webhookFromUrl;
 
 // Capture UTM tracking params from the URL.
 // Normal links use: ?utm_source=instagram&utm_medium=paid&utm_campaign=summer_property
@@ -675,14 +679,22 @@ function addMessage(sender, text) {
   return div;
 }
 
+const RENT_BUDGET_OPTIONS = ["Under ₹20k/mo", "₹20k–40k/mo", "₹40k–80k/mo", "₹80k+/mo"];
+function optionsFor(q) {
+  if (q.key === "budget" && String(knownFields.purpose || "").toLowerCase().includes("rent")) {
+    return RENT_BUDGET_OPTIONS;
+  }
+  return q.options;
+}
 function showOptionsIfAny() {
   optionsContainer.innerHTML = "";
   const nextQ = CONFIG.questions.find(q => !knownFields[q.key]);
-  if (!nextQ || !nextQ.options || !nextQ.options.length) return;
+  const opts = nextQ ? optionsFor(nextQ) : null;
+  if (!nextQ || !opts || !opts.length) return;
 
   const row = document.createElement("div");
   row.className = "optionsRow";
-  nextQ.options.forEach(opt => {
+  opts.forEach(opt => {
     const btn = document.createElement("button");
     btn.className = "optionBtn";
     btn.textContent = opt;
