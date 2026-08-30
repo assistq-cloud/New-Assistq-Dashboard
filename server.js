@@ -52,7 +52,7 @@ function ensureStoreShape(s){
   // s.realEstate.automation above is kept only as the seed template for any
   // client that doesn't have its own config yet — never edit it directly.
   s.realEstate.automationByClient=s.realEstate.automationByClient||{};
- s.clients=s.clients||defaultStore.clients; s.clientProfiles=s.clientProfiles||{}; s.keywords=s.keywords||[]; s.leads=s.leads||[]; s.conversations=s.conversations||{}; s.utm=s.utm||{}; s.gsc=s.gsc||defaultStore.gsc; s.gsc.byClient=s.gsc.byClient||{}; s.ga4=s.ga4||defaultStore.ga4; s.ga4.byClient=s.ga4.byClient||{}; s.google=s.google||defaultStore.google; s.google.byClient=s.google.byClient||{}; s.seoAudits=s.seoAudits||{}; s.reportHistory=s.reportHistory||[]; s.security=s.security||{adminPasswordHash:null};
+ s.clients=s.clients||defaultStore.clients; s.clientProfiles=s.clientProfiles||{}; s.keywords=s.keywords||[]; s.leads=s.leads||[]; s.conversations=s.conversations||{}; s.utm=s.utm||{}; s.gsc=s.gsc||defaultStore.gsc; s.gsc.byClient=s.gsc.byClient||{}; s.ga4=s.ga4||defaultStore.ga4; s.ga4.byClient=s.ga4.byClient||{}; s.google=s.google||defaultStore.google; s.google.byClient=s.google.byClient||{}; s.seoAudits=s.seoAudits||{}; s.reportHistory=s.reportHistory||[]; s.security=s.security||{adminPasswordHash:null}; s.whatsappThreads=s.whatsappThreads||{};
   s.clients=s.clients.map(c=>({...c,accessCode:c.accessCode||crypto.randomBytes(4).toString("hex").toUpperCase(),plan:c.plan||"Starter",subscriptionStatus:c.subscriptionStatus||"active",subscriptionStart:c.subscriptionStart||null,subscriptionEnd:c.subscriptionEnd||null}));
   s.leads=s.leads.map(l=>({...l,pipelineStage:l.pipelineStage||"NEW",assignedTo:l.assignedTo||null,notes:l.notes||"",responseMinutes:l.responseMinutes??null,updatedAt:l.updatedAt||l.date||new Date().toISOString()}));
   return s;
@@ -93,16 +93,10 @@ function requireAuth(req,res,next){if(!req.session.user)return res.status(401).j
 function requireAdmin(req,res,next){if(!req.session.user||req.session.user.role!=="admin")return res.status(403).json({error:"Admin access required"});next();}
 function selectedClient(req,s){return normaliseClientId(req.query.clientId||req.body?.clientId||req.session.user?.clientId||s.settings.clientId);}
 
-// Server-side plan gating — mirrors PLAN_FEATURES in app.js, but this is the
-// real enforcement boundary (the sidebar hiding a page is cosmetic; this is
-// what actually blocks the underlying action, regardless of whether it was
-// triggered from the dashboard UI, a chatbot's bridge call, or a direct API
-// request). Keep both lists in sync if plan features change.
-// NOTE: Automation config (s.realEstate.automation) is currently a single
-// shared object, not per-client — gating below controls WHETHER a given
-// client's leads get automation applied, but all Premium clients currently
-// share the same drip-followup rules/timings. Worth a proper per-client
-// config migration if clients need to customise their own automation rules.
+// Server-side plan gating — this is the real enforcement boundary (the
+// sidebar hiding a page is cosmetic; this is what actually blocks the
+// underlying action, regardless of whether it was triggered from the
+// dashboard UI, a chatbot's bridge call, or a direct API request).
 function clientPlanTier(s, clientId) {
   const c = s.clients.find(x => x.id === clientId);
   const plan = String(c?.plan || "Premium").toLowerCase().trim();
@@ -323,7 +317,7 @@ app.get("/api/state",requireAuth,(req,res)=>{
   const filter=x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId);
   const client=clientSettings(s,clientId);
   if(req.session.user.role!=="admin" && !client.subscription.active)return res.status(403).json({error:`Client subscription is ${client.subscription.status}. Please contact ASSISTQ to renew.`,subscription:client.subscription});
-  const profile=s.clientProfiles[clientId]||{assistant:client.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||[]};const gscClient=s.gsc.byClient[clientId]||s.gsc;const gaClient=s.ga4.byClient[clientId]||s.ga4;const out={settings:client,clientId,clients:req.session.user.role==="admin"?s.clients:s.clients.filter(c=>c.id===clientId),leads:s.leads.filter(filter),conversations:Object.fromEntries(Object.entries(s.conversations).filter(([,x])=>filter(x))),keywords:s.keywords.filter(x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId)),utm:s.utm,gsc:gscClient,ga4:gaClient,seo:s.seoAudits[clientId]||null,reportHistory:s.reportHistory.filter(x=>x.clientId===clientId),profile,googleConnected:!!googleConnection(s,clientId)?.tokens,googleEmail:googleConnection(s,clientId)?.email||null,user:req.session.user};
+  const profile=s.clientProfiles[clientId]||{assistant:client.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||[]};const gscClient=s.gsc.byClient[clientId]||s.gsc;const gaClient=s.ga4.byClient[clientId]||s.ga4;const out={settings:client,clientId,clients:req.session.user.role==="admin"?s.clients:s.clients.filter(c=>c.id===clientId),leads:s.leads.filter(filter).filter(x=>!x.mergedInto),conversations:Object.fromEntries(Object.entries(s.conversations).filter(([,x])=>filter(x))),keywords:s.keywords.filter(x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId)),utm:s.utm,gsc:gscClient,ga4:gaClient,seo:s.seoAudits[clientId]||null,reportHistory:s.reportHistory.filter(x=>x.clientId===clientId),profile,googleConnected:!!googleConnection(s,clientId)?.tokens,googleEmail:googleConnection(s,clientId)?.email||null,user:req.session.user};
   writeStore(s);res.json(out);
 });
 
@@ -430,8 +424,20 @@ function seedLeadFollowups(s,clientId,l){
     s.realEstate.followups.push({id:reId("fu"),clientId,leadId:l.id,channel:String(rule.channel||"whatsapp"),dueAt:due,message:String(rule.message||""),status:"pending",ruleKey:key,createdAt:reNow()});
   }
 }
-function processRealEstateAutomation(){
-  try{const s=ensureStoreShape(readStore()); let changed=false; const now=Date.now();
+// This used to only mark a follow-up "queued" and stop there — a human
+// still had to open WhatsApp and click send by hand, so "Premium: automated
+// WhatsApp messaging" was really "Premium: a slightly nicer manual queue".
+// Now, if WA_PHONE_NUMBER_ID/WA_ACCESS_TOKEN/WA_FOLLOWUP_TEMPLATE_NAME are
+// all configured, the worker actually sends the follow-up through the
+// Cloud API the moment it comes due. It only ever attempts a send ONCE per
+// follow-up (guarded by autoSendAttempted) — a permanently-failing number
+// won't get hammered every 60 seconds. If WhatsApp isn't configured, or the
+// send fails (unapproved template, bad number, API error), the follow-up
+// simply stays "queued" exactly as before — the dashboard's one-tap
+// click-to-chat link is always the fallback, never a dead end.
+async function processRealEstateAutomation(){
+  try{
+    let s=ensureStoreShape(readStore()); let changed=false; const now=Date.now();
     for(const l of s.leads){
       const age=(now-new Date(l.date||now).getTime())/60000;
       if(!l.clientId || !planHasFeature(clientPlanTier(s,l.clientId),"automation")) continue; // missed-lead/escalation alerts are a Premium feature
@@ -439,12 +445,117 @@ function processRealEstateAutomation(){
       if(l.pipelineStage==="NEW" && age>=Number(cfg.missedLeadMinutes||10) && !l.missedLeadAt){l.missedLeadAt=reNow();activity(s,l.clientId,"alert",`Missed lead alert: ${l.name} has not been contacted`,{leadId:l.id});changed=true;}
       if(l.pipelineStage==="NEW" && age>=Number(cfg.escalationMinutes||30) && !l.escalatedAt){l.escalatedAt=reNow();activity(s,l.clientId,"escalation",`Escalation: ${l.name} is still uncontacted after ${Math.round(age)} minutes`,{leadId:l.id});changed=true;}
     }
-    for(const f of s.realEstate.followups){if(f.status==="pending"&&new Date(f.dueAt).getTime()<=now&&!f.queuedAt){f.queuedAt=reNow();f.status="queued";activity(s,f.clientId,"followup",`Follow-up queued for lead ${f.leadId}`,{leadId:f.leadId,followupId:f.id,channel:f.channel});changed=true;}}
+    const dueFollowups=s.realEstate.followups.filter(f=>f.status==="pending"&&new Date(f.dueAt).getTime()<=now&&!f.queuedAt&&planHasFeature(clientPlanTier(s,f.clientId),"automation"));
+    for(const f of dueFollowups){f.queuedAt=reNow();f.status="queued";activity(s,f.clientId,"followup",`Follow-up queued for lead ${f.leadId}`,{leadId:f.leadId,followupId:f.id,channel:f.channel});changed=true;}
     if(changed) writeStore(s);
+
+    // Attempt automated sends for anything just queued on this pass, one at a time.
+    const c=waConfig();
+    for(const f of dueFollowups){
+      if(f.channel!=="whatsapp"||f.autoSendAttempted)continue;
+      s=ensureStoreShape(readStore());
+      const fresh=s.realEstate.followups.find(x=>x.id===f.id);
+      if(!fresh||fresh.autoSendAttempted)continue;
+      fresh.autoSendAttempted=true;
+      if(!c.phoneNumberId||!c.accessToken||!c.followupTemplate){writeStore(s);continue;}
+      const lead=s.leads.find(x=>x.id===fresh.leadId&&x.clientId===fresh.clientId);
+      const phone=lead?.phone;
+      if(!phone){activity(s,fresh.clientId,"followup",`Could not auto-send follow-up for lead ${fresh.leadId} — no phone number on file`,{leadId:fresh.leadId,followupId:fresh.id});writeStore(s);continue;}
+      try{
+        const out=await sendWhatsAppTemplate(phone,c.followupTemplate,c.followupLanguage,[fresh.message]);
+        fresh.status="sent";fresh.sentAt=reNow();fresh.messageId=out.messageId;
+        activity(s,fresh.clientId,"followup",`Follow-up sent automatically via WhatsApp to ${lead.name||phone}`,{leadId:fresh.leadId,followupId:fresh.id,messageId:out.messageId});
+        pushThreadMessage(s,fresh.clientId,phone,{direction:"out",text:fresh.message,at:reNow(),messageId:out.messageId,automated:true});
+      }catch(err){
+        fresh.lastSendError=err.message;
+        activity(s,fresh.clientId,"followup",`Automated WhatsApp send failed for ${lead.name||phone} — left queued for manual send (${err.message})`,{leadId:fresh.leadId,followupId:fresh.id});
+      }
+      writeStore(s);
+    }
   }catch(e){console.error("ASSISTQ automation worker:",e.message)}
 }
-function saveLeadInternal(body){const s=ensureStoreShape(readStore());const clientId=normaliseClientId(body.clientId||s.settings.clientId);const cs=clientSettings(s,clientId);const fields=normaliseFields(body.fields||{});const messages=Array.isArray(body.messages)?body.messages:[];const score=Number(body.score??scoreLead(fields,messages,cs));const status=statusFor(score,cs);const utm=cleanUTM(body.utm||{});const lead={clientId,id:body.id||body.leadId||"AQ-"+crypto.randomBytes(4).toString("hex").toUpperCase(),name:body.name||fields.name||"Unknown",phone:body.phone||fields.phone||"",email:body.email||fields.email||"",requirement:body.requirement||[fields.purpose,fields.location,fields.configuration].filter(Boolean).join(" · "),budget:body.budget||fields.budget||"",score,scoreBreakdown:scoreBreakdown(fields,messages,cs),status,source:body.utm_source||utm.source||"Direct",medium:body.utm_medium||utm.medium||"",campaign:body.utm_campaign||utm.campaign||"",utm,conversationId:body.conversationId||body.leadId||null,messagesCount:messages.length,date:new Date().toISOString(),pipelineStage:body.pipelineStage||"NEW",assignedTo:body.assignedTo||null,notes:String(body.notes||"").slice(0,5000),responseMinutes:body.responseMinutes==null?null:Number(body.responseMinutes)||0,updatedAt:new Date().toISOString()};const idx=s.leads.findIndex(x=>x.id===lead.id&&x.clientId===clientId);if(idx>=0)s.leads[idx]={...s.leads[idx],...lead};else {s.leads.unshift(lead); autoAssignLead(s,clientId,lead); seedLeadFollowups(s,clientId,lead);}const key=`${clientId}|${lead.source}|${lead.medium}|${lead.campaign}`;s.utm[key]=(s.utm[key]||0)+1;if(lead.conversationId&&s.conversations[lead.conversationId])Object.assign(s.conversations[lead.conversationId],{score,status,fields,clientId,utm});writeStore(s);return lead;}
+function normPhone(p){const d=String(p||"").replace(/\D/g,"");return d.length>10?d.slice(-10):d;}
+function normEmail(e){return String(e||"").trim().toLowerCase();}
+// Cheap but effective duplicate detection: same client, different lead,
+// same last-10-digit phone or same email, and not already merged away.
+// We never silently drop or auto-merge data (a false-positive merge loses
+// a genuine second enquiry) — we flag it and let staff confirm the merge
+// from the lead detail panel, which then folds visits/followups/notes
+// from the duplicate into the original and hides the duplicate from the
+// active lead views.
+function findPossibleDuplicate(s,clientId,phone,email,excludeId){
+  const p=normPhone(phone),e=normEmail(email);
+  if(!p&&!e)return null;
+  return s.leads.find(x=>x.clientId===clientId&&x.id!==excludeId&&!x.mergedInto&&((p&&normPhone(x.phone)===p)||(e&&normEmail(x.email)===e)))||null;
+}
+function saveLeadInternal(body){const s=ensureStoreShape(readStore());const clientId=normaliseClientId(body.clientId||s.settings.clientId);const cs=clientSettings(s,clientId);const fields=normaliseFields(body.fields||{});const messages=Array.isArray(body.messages)?body.messages:[];const score=Number(body.score??scoreLead(fields,messages,cs));const status=statusFor(score,cs);const utm=cleanUTM(body.utm||{});const lead={clientId,id:body.id||body.leadId||"AQ-"+crypto.randomBytes(4).toString("hex").toUpperCase(),name:body.name||fields.name||"Unknown",phone:body.phone||fields.phone||"",email:body.email||fields.email||"",requirement:body.requirement||[fields.purpose,fields.location,fields.configuration].filter(Boolean).join(" · "),budget:body.budget||fields.budget||"",score,scoreBreakdown:scoreBreakdown(fields,messages,cs),status,source:body.utm_source||utm.source||"Direct",medium:body.utm_medium||utm.medium||"",campaign:body.utm_campaign||utm.campaign||"",utm,conversationId:body.conversationId||body.leadId||null,messagesCount:messages.length,date:new Date().toISOString(),pipelineStage:body.pipelineStage||"NEW",assignedTo:body.assignedTo||null,notes:String(body.notes||"").slice(0,5000),responseMinutes:body.responseMinutes==null?null:Number(body.responseMinutes)||0,updatedAt:new Date().toISOString()};const idx=s.leads.findIndex(x=>x.id===lead.id&&x.clientId===clientId);if(idx>=0)s.leads[idx]={...s.leads[idx],...lead};else {const dup=findPossibleDuplicate(s,clientId,lead.phone,lead.email,lead.id);if(dup){lead.possibleDuplicateOf=dup.id;activity(s,clientId,"duplicate",`Possible duplicate: ${lead.name} matches existing lead ${dup.name}`,{leadId:lead.id,matchedLeadId:dup.id});} s.leads.unshift(lead); autoAssignLead(s,clientId,lead); seedLeadFollowups(s,clientId,lead);}const key=`${clientId}|${lead.source}|${lead.medium}|${lead.campaign}`;s.utm[key]=(s.utm[key]||0)+1;if(lead.conversationId&&s.conversations[lead.conversationId])Object.assign(s.conversations[lead.conversationId],{score,status,fields,clientId,utm});writeStore(s);return lead;}
 app.post("/api/leads",requireWebhookSecret,(req,res)=>{try{res.status(201).json({ok:true,lead:saveLeadInternal(req.body||{})});}catch(e){res.status(500).json({error:e.message});}});
+
+// Every real-estate CRM comparison names the same #1 requirement: auto-capture
+// from every portal you advertise on (99acres, MagicBricks, Housing.com,
+// NoBroker, Meta/Instagram Lead Ads) instead of manual CSV exports. Each of
+// those sends a differently-shaped payload, so this endpoint accepts a raw
+// payload plus a `source` label, normalises the common field-name variants
+// portals actually use, and drops it into the exact same scoring/pipeline/
+// automation path a chatbot lead goes through. Point a Zapier/Make/Meta
+// Lead Ads webhook at this one URL (with the WEBHOOK_SECRET header) and new
+// portal leads need zero manual entry.
+function normalisePortalLead(raw={},source="Portal"){
+  const pick=(...keys)=>{for(const k of keys){const v=raw[k];if(v!==undefined&&v!==null&&String(v).trim())return String(v).trim();}return "";};
+  return {
+    name:pick("name","full_name","fullName","contact_name","customer_name","Name"),
+    phone:pick("phone","mobile","contact_number","contactNumber","mobile_number","phone_number","Phone","Mobile"),
+    email:pick("email","email_id","emailId","Email"),
+    budget:pick("budget","budget_range","Budget"),
+    requirement:pick("locality","location","project_name","property_name","Locality","Project","message","query","remarks","Message"),
+    notes:pick("message","query","remarks","comments","Message","Comments"),
+    utm_source:source,
+    utm_medium:"portal"
+  };
+}
+app.post("/api/leads/import",requireWebhookSecret,rateLimit("leads-import",120,60000),(req,res)=>{
+  try{
+    const source=String(req.body.source||req.query.source||"Portal").trim()||"Portal";
+    const raw=req.body.lead||req.body.data||req.body.entry||req.body;
+    const mapped=normalisePortalLead(raw,source);
+    if(!mapped.phone&&!mapped.email&&!mapped.name)return res.status(400).json({error:"Could not find a name, phone or email in the payload. Check the field names your source sends."});
+    const clientId=String(req.body.clientId||req.query.clientId||"").trim();
+    if(!clientId)return res.status(400).json({error:"clientId is required (query param or body field) so ASSISTQ knows which client this portal lead belongs to."});
+    const lead=saveLeadInternal({...mapped,clientId});
+    res.status(201).json({ok:true,lead});
+  }catch(e){res.status(500).json({error:e.message});}
+});
+
+// Manual duplicate merge — folds a flagged duplicate's visits, follow-ups,
+// documents and commissions into the original lead, fills any fields the
+// original was missing, appends notes, and hides the duplicate from active
+// views (it stays in the database for audit purposes, just tagged mergedInto).
+app.post("/api/realestate/leads/:id/merge",requireAuth,(req,res)=>{
+  try{
+    const s=ensureStoreShape(readStore()),id=reClient(req,s);
+    const dup=leadById(s,req.params.id,id);
+    if(!dup)return res.status(404).json({error:"Lead not found"});
+    const targetId=req.body.intoId||dup.possibleDuplicateOf;
+    const target=targetId?leadById(s,targetId,id):null;
+    if(!target)return res.status(400).json({error:"No merge target — provide intoId or use a lead with a detected duplicate match."});
+    if(target.id===dup.id)return res.status(400).json({error:"Cannot merge a lead into itself."});
+    if(!target.phone&&dup.phone)target.phone=dup.phone;
+    if(!target.email&&dup.email)target.email=dup.email;
+    if(!target.budget&&dup.budget)target.budget=dup.budget;
+    if(!target.requirement&&dup.requirement)target.requirement=dup.requirement;
+    if(dup.notes)target.notes=[target.notes,dup.notes].filter(Boolean).join(" | ").slice(0,5000);
+    if(dup.score>target.score){target.score=dup.score;target.status=dup.status;target.scoreBreakdown=dup.scoreBreakdown;}
+    for(const v of s.realEstate.visits)if(v.clientId===id&&v.leadId===dup.id)v.leadId=target.id;
+    for(const f of s.realEstate.followups)if(f.clientId===id&&f.leadId===dup.id)f.leadId=target.id;
+    for(const doc of s.realEstate.documents)if(doc.clientId===id&&doc.leadId===dup.id)doc.leadId=target.id;
+    for(const c of s.realEstate.commissions)if(c.clientId===id&&c.leadId===dup.id)c.leadId=target.id;
+    dup.mergedInto=target.id;
+    target.updatedAt=reNow();
+    activity(s,id,"duplicate",`${dup.name} merged into ${target.name}`,{leadId:target.id,mergedLeadId:dup.id});
+    writeStore(s);
+    res.json({ok:true,lead:enrichLead(target,s)});
+  }catch(e){res.status(403).json({error:e.message});}
+});
 // These two routes are called directly from the public, client-side chatbot widget
 // (see ASSISTQ_Chatbot_Connected.html), so they intentionally do NOT require
 // WEBHOOK_SECRET — a browser-side script can never hold a secret safely, and
@@ -458,7 +569,13 @@ app.post("/api/bridge/lead",rateLimit("lead",60,60000),requireActiveClient,(req,
 // ---------- Keywords ----------
 app.post("/api/keywords",requireAuth,(req,res)=>{const s=ensureStoreShape(readStore());const clientId=selectedClient(req,s);if(req.session.user.role!=="admin"&&req.session.user.clientId!==clientId)return res.status(403).json({error:"Workspace access denied"});const keyword=String(req.body.keyword||"").trim();if(!keyword)return res.status(400).json({error:"Keyword required"});const x={id:"kw_"+crypto.randomBytes(4).toString("hex"),clientId,keyword,targetUrl:String(req.body.targetUrl||""),priority:String(req.body.priority||"Medium"),intent:String(req.body.intent||"Commercial")};s.keywords.push(x);writeStore(s);res.status(201).json(x);});
 app.delete("/api/keywords/:id",requireAuth,(req,res)=>{const s=ensureStoreShape(readStore());s.keywords=s.keywords.filter(x=>x.id!==req.params.id);writeStore(s);res.json({ok:true});});
-app.post("/api/keywords/sync",requireAuth,(req,res)=>{const s=ensureStoreShape(readStore());const clientId=selectedClient(req,s);const clientGsc=s.gsc.byClient[clientId]||s.gsc;const g=clientGsc.rows||[];let count=0;s.keywords=s.keywords.map(k=>{if(k.clientId!==clientId)return k;const q=g.find(r=>r.query.toLowerCase()===k.keyword.toLowerCase())||g.find(r=>r.query.toLowerCase().includes(k.keyword.toLowerCase())||k.keyword.toLowerCase().includes(r.query.toLowerCase()));if(q){count++;return {...k,lastPosition:q.position,lastClicks:q.clicks,lastImpressions:q.impressions,lastCtr:q.ctr,rankSource:"Google Search Console",rankSyncedAt:new Date().toISOString()};}return k;});writeStore(s);res.json({ok:true,matched:count});});
+// Every sync used to just overwrite lastPosition, so a keyword's rank
+// movement (the "Pos. 4 ▲3" trend the marketing page shows as a demo) was
+// never actually computed anywhere — there was nothing to diff against.
+// Now every sync appends a snapshot to a capped history array and computes
+// `trend` = previous position minus current position, so a positive trend
+// means the keyword moved UP the results (lower position number is better).
+app.post("/api/keywords/sync",requireAuth,(req,res)=>{const s=ensureStoreShape(readStore());const clientId=selectedClient(req,s);const clientGsc=s.gsc.byClient[clientId]||s.gsc;const g=clientGsc.rows||[];let count=0;const syncedAt=new Date().toISOString();s.keywords=s.keywords.map(k=>{if(k.clientId!==clientId)return k;const q=g.find(r=>r.query.toLowerCase()===k.keyword.toLowerCase())||g.find(r=>r.query.toLowerCase().includes(k.keyword.toLowerCase())||k.keyword.toLowerCase().includes(r.query.toLowerCase()));if(!q)return k;count++;const prevPosition=k.lastPosition!=null?Number(k.lastPosition):null;const trend=prevPosition!=null?Math.round((prevPosition-Number(q.position))*10)/10:null;const history=[...(Array.isArray(k.history)?k.history:[]),{position:q.position,clicks:q.clicks,impressions:q.impressions,ctr:q.ctr,syncedAt}].slice(-12);return {...k,lastPosition:q.position,lastClicks:q.clicks,lastImpressions:q.impressions,lastCtr:q.ctr,trend,history,rankSource:"Google Search Console",rankSyncedAt:syncedAt};});writeStore(s);res.json({ok:true,matched:count});});
 
 // ---------- SEO crawler ----------
 function absolute(base,href){try{return new URL(href,base).toString().split("#")[0];}catch{return null;}}
@@ -478,12 +595,10 @@ function activity(s,clientId,type,text,meta={}){s.realEstate.activities.unshift(
 function enrichLead(l,s){const visits=s.realEstate.visits.filter(v=>v.clientId===l.clientId&&v.leadId===l.id);const f=s.realEstate.followups.filter(v=>v.clientId===l.clientId&&v.leadId===l.id);const team=s.realEstate.team.find(t=>t.clientId===l.clientId&&t.id===l.assignedTo);return {...l,visits,followups:f,assignedUser:team||null};}
 function leadById(s,id,clientId){return s.leads.find(x=>x.id===id&&x.clientId===clientId);}
 app.get("/api/realestate/summary",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const leads=s.leads.filter(x=>x.clientId===id);const visits=s.realEstate.visits.filter(x=>x.clientId===id);const team=s.realEstate.team.filter(x=>x.clientId===id);const bookings=leads.filter(x=>x.pipelineStage==="BOOKING").length;const qualified=leads.filter(x=>x.score>=50).length;const contacted=leads.filter(x=>["CONTACTED","INTERESTED","SITE_VISIT_SCHEDULED","SITE_VISIT_COMPLETED","NEGOTIATION","BOOKING"].includes(x.pipelineStage)).length;const scheduled=visits.filter(x=>x.status==="scheduled").length;const completed=visits.filter(x=>x.status==="completed").length;const negotiation=leads.filter(x=>x.pipelineStage==="NEGOTIATION").length;const bySource={};for(const l of leads){const key=l.source||"Direct";bySource[key]??={leads:0,qualified:0,visits:0,bookings:0};bySource[key].leads++;if(l.score>=50)bySource[key].qualified++;if(visits.some(v=>v.leadId===l.id&&v.status==="completed"))bySource[key].visits++;if(l.pipelineStage==="BOOKING")bySource[key].bookings++;}res.json({clientId:id,counts:{leads:leads.length,qualified,contacted,scheduled,completed,negotiation,bookings},bySource,team:team.map(t=>{const tl=leads.filter(l=>l.assignedTo===t.id);return {...t,leads:tl.length,contacted:tl.filter(l=>l.pipelineStage!=="NEW").length,visits:visits.filter(v=>v.assignedTo===t.id&&v.status==="completed").length,bookings:tl.filter(l=>l.pipelineStage==="BOOKING").length,responseMinutes:tl.length?Math.round(tl.reduce((a,l)=>a+(l.responseMinutes||0),0)/tl.filter(l=>l.responseMinutes!=null).length||0):0};})});}catch(e){res.status(e.message.includes("access")?403:500).json({error:e.message});}});
-app.get("/api/realestate/leads",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);res.json(s.leads.filter(x=>x.clientId===id).map(l=>enrichLead(l,s)));}catch(e){res.status(403).json({error:e.message});}});
+app.get("/api/realestate/leads",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);res.json(s.leads.filter(x=>x.clientId===id&&!x.mergedInto).map(l=>enrichLead(l,s)));}catch(e){res.status(403).json({error:e.message});}});
 app.patch("/api/realestate/leads/:id",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s),l=leadById(s,req.params.id,id);if(!l)return res.status(404).json({error:"Lead not found"});const allowedStage=["NEW","QUALIFIED","CONTACTED","INTERESTED","SITE_VISIT_SCHEDULED","SITE_VISIT_COMPLETED","NEGOTIATION","BOOKING","LOST"];if(req.body.pipelineStage&&allowedStage.includes(req.body.pipelineStage)){const wasBooking=l.pipelineStage==="BOOKING";l.pipelineStage=req.body.pipelineStage;activity(s,id,"stage",`${l.name} moved to ${l.pipelineStage}`,{leadId:l.id});
-  // Site visits happen before a booking in the pipeline order above — once
-  // a lead is actually booked, automatically start the post-sale/possession
-  // tracker for them (Premium feature) instead of requiring a separate
-  // manual step in the Possession Tracker page.
+  // Once a lead is actually booked, automatically start the post-sale/possession
+  // tracker for them (Premium feature) instead of requiring a separate manual step.
   if(l.pipelineStage==="BOOKING"&&!wasBooking&&planHasFeature(clientPlanTier(s,id),"possession")&&!s.realEstate.possession.some(p=>p.leadId===l.id)){const poss={id:reId("poss"),clientId:id,leadId:l.id,projectId:null,unit:"",expectedDate:"",stage:"BOOKING_CONFIRMED",notes:"Auto-started when lead reached Booking stage.",createdAt:reNow(),updatedAt:reNow()};s.realEstate.possession.push(poss);activity(s,id,"possession",`Post-sale tracking auto-started for ${l.name}`,{leadId:l.id,possessionId:poss.id});}
 }if(req.body.assignedTo!==undefined){l.assignedTo=req.body.assignedTo||null;activity(s,id,"assignment",`${l.name} assigned to ${l.assignedTo||"unassigned"}`,{leadId:l.id});}if(req.body.notes!==undefined)l.notes=String(req.body.notes).slice(0,5000);if(req.body.responseMinutes!==undefined)l.responseMinutes=Math.max(0,Number(req.body.responseMinutes)||0);l.updatedAt=reNow();writeStore(s);res.json(enrichLead(l,s));}catch(e){res.status(403).json({error:e.message});}});
 app.get("/api/realestate/team",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);if(req.session.user?.role!=="admin"&&!planHasFeature(clientPlanTier(s,id),"team"))return res.status(403).json({error:"Sales team management requires the Premium plan."});res.json(s.realEstate.team.filter(x=>x.clientId===id));}catch(e){res.status(403).json({error:e.message});}});
@@ -508,14 +623,67 @@ app.get("/api/realestate/audit",requireAuth,(req,res)=>{try{const s=ensureStoreS
 
 
 // ---------- WhatsApp Cloud API bridge ----------
-function waConfig(){return {phoneNumberId:process.env.WA_PHONE_NUMBER_ID||"",accessToken:process.env.WA_ACCESS_TOKEN||"",verifyToken:process.env.WA_VERIFY_TOKEN||"",appSecret:process.env.WA_APP_SECRET||"",apiVersion:process.env.WA_API_VERSION||"v23.0"};}
-app.get("/api/whatsapp/status",requireAuth,(req,res)=>{const c=waConfig();res.json({configured:!!(c.phoneNumberId&&c.accessToken),phoneNumberId:c.phoneNumberId?"configured":"missing",verifyToken:c.verifyToken?"configured":"missing",appSecret:c.appSecret?"configured":"missing",apiVersion:c.apiVersion});});
-app.post("/api/whatsapp/send-template",requireAuth,async(req,res)=>{try{const c=waConfig();if(!c.phoneNumberId||!c.accessToken)return res.status(503).json({error:"WhatsApp Cloud API is not configured. Add WA_PHONE_NUMBER_ID and WA_ACCESS_TOKEN."});const to=String(req.body.to||"").replace(/\D/g,"");const template=String(req.body.template||"").trim();const language=String(req.body.language||"en_US");const params=Array.isArray(req.body.params)?req.body.params.map(x=>({type:"text",text:String(x)})):[];if(!to||!template)return res.status(400).json({error:"to and template are required"});const body={messaging_product:"whatsapp",to,type:"template",template:{name:template,language:{code:language},...(params.length?{components:[{type:"body",parameters:params}]}:{})}};const r=await fetch(`https://graph.facebook.com/${c.apiVersion}/${c.phoneNumberId}/messages`,{method:"POST",headers:{Authorization:`Bearer ${c.accessToken}`,"Content-Type":"application/json"},body:JSON.stringify(body)});const j=await r.json().catch(()=>({}));if(!r.ok)return res.status(r.status).json({error:j.error?.message||"WhatsApp API request failed",details:j});res.json({ok:true,messageId:j.messages?.[0]?.id||null,response:j});}catch(e){res.status(500).json({error:e.message});}});
+function waConfig(){return {phoneNumberId:process.env.WA_PHONE_NUMBER_ID||"",accessToken:process.env.WA_ACCESS_TOKEN||"",verifyToken:process.env.WA_VERIFY_TOKEN||"",appSecret:process.env.WA_APP_SECRET||"",apiVersion:process.env.WA_API_VERSION||"v23.0",followupTemplate:process.env.WA_FOLLOWUP_TEMPLATE_NAME||"",followupLanguage:process.env.WA_FOLLOWUP_TEMPLATE_LANG||"en_US"};}
+// Shared sender used by both the manual "Send template" button AND the
+// automation engine below. Throws on failure so callers can decide what to
+// do (the HTTP route turns it into a response; the automation worker logs
+// it and leaves the follow-up queued for manual click-to-chat instead).
+async function sendWhatsAppTemplate(to,template,language,params=[]){
+  const c=waConfig();
+  if(!c.phoneNumberId||!c.accessToken)throw new Error("WhatsApp Cloud API is not configured (WA_PHONE_NUMBER_ID / WA_ACCESS_TOKEN missing).");
+  const digits=String(to||"").replace(/\D/g,"");
+  if(!digits||!template)throw new Error("A recipient number and template name are required.");
+  const body={messaging_product:"whatsapp",to:digits,type:"template",template:{name:template,language:{code:language||"en_US"},...(params.length?{components:[{type:"body",parameters:params.map(x=>({type:"text",text:String(x)}))}]}:{})}};
+  const r=await fetch(`https://graph.facebook.com/${c.apiVersion}/${c.phoneNumberId}/messages`,{method:"POST",headers:{Authorization:`Bearer ${c.accessToken}`,"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(j.error?.message||"WhatsApp API request failed");
+  return {messageId:j.messages?.[0]?.id||null,response:j};
+}
+// Free-form text (not a template) — only legal within Meta's 24h customer
+// service window after the contact's last inbound message. Callers are
+// expected to check that window themselves (the inbox reply route below
+// does); this function just makes the API call.
+async function sendWhatsAppText(to,text){
+  const c=waConfig();
+  if(!c.phoneNumberId||!c.accessToken)throw new Error("WhatsApp Cloud API is not configured (WA_PHONE_NUMBER_ID / WA_ACCESS_TOKEN missing).");
+  const digits=String(to||"").replace(/\D/g,"");
+  if(!digits||!text)throw new Error("A recipient number and message text are required.");
+  const body={messaging_product:"whatsapp",to:digits,type:"text",text:{body:String(text).slice(0,4096)}};
+  const r=await fetch(`https://graph.facebook.com/${c.apiVersion}/${c.phoneNumberId}/messages`,{method:"POST",headers:{Authorization:`Bearer ${c.accessToken}`,"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(j.error?.message||"WhatsApp API request failed");
+  return {messageId:j.messages?.[0]?.id||null,response:j};
+}
+// Incoming/outgoing WhatsApp messages used to only ever get flattened into
+// the generic activity feed as one-line text — there was no actual
+// conversation view, which every real-estate CRM comparison lists as a
+// baseline "WhatsApp inbox" requirement. This keeps a proper per-contact
+// thread (capped at the last 200 messages) so staff can see and reply to a
+// real conversation instead of hunting through the activity log.
+function threadKey(phone){return normPhone(phone);}
+function pushThreadMessage(s,clientId,phone,message){
+  const key=threadKey(phone);
+  if(!key)return;
+  s.whatsappThreads[clientId]=s.whatsappThreads[clientId]||{};
+  const t=s.whatsappThreads[clientId][key]||{phone,leadId:null,messages:[],unread:false};
+  t.phone=phone||t.phone;
+  t.messages=[...t.messages,message].slice(-200);
+  t.lastMessageAt=message.at;
+  if(message.direction==="in")t.unread=true;
+  if(!t.leadId){const lead=s.leads.find(l=>l.clientId===clientId&&normPhone(l.phone)===key&&!l.mergedInto);if(lead)t.leadId=lead.id;}
+  s.whatsappThreads[clientId][key]=t;
+}
+app.get("/api/whatsapp/status",requireAuth,(req,res)=>{const c=waConfig();res.json({configured:!!(c.phoneNumberId&&c.accessToken),phoneNumberId:c.phoneNumberId?"configured":"missing",verifyToken:c.verifyToken?"configured":"missing",appSecret:c.appSecret?"configured":"missing",apiVersion:c.apiVersion,automatedFollowups:!!(c.phoneNumberId&&c.accessToken&&c.followupTemplate),followupTemplate:c.followupTemplate?"configured":"missing — automation will queue for manual send only"});});
+app.post("/api/whatsapp/send-template",requireAuth,async(req,res)=>{try{const s0=ensureStoreShape(readStore());const id=selectedClient(req,s0);const to=String(req.body.to||"");const template=String(req.body.template||"").trim();const language=String(req.body.language||"en_US");const params=Array.isArray(req.body.params)?req.body.params:[];if(!to||!template)return res.status(400).json({error:"to and template are required"});const out=await sendWhatsAppTemplate(to,template,language,params);const s=ensureStoreShape(readStore());pushThreadMessage(s,id,to,{direction:"out",text:params.length?`[${template}] ${params.join(" · ")}`:`[${template}]`,at:reNow(),messageId:out.messageId});writeStore(s);res.json({ok:true,...out});}catch(e){res.status(502).json({error:e.message});}});
 app.get("/api/whatsapp/webhook",(req,res)=>{const c=waConfig();if(!c.verifyToken)return res.status(503).send("WhatsApp webhook is not configured");if(req.query["hub.verify_token"]!==c.verifyToken)return res.status(403).send("Invalid verify token");res.status(200).send(String(req.query["hub.challenge"]||""));});
-app.post("/api/whatsapp/webhook",(req,res)=>{const c=waConfig();const signature=req.headers["x-hub-signature-256"];if(c.appSecret&&signature){const raw=req.rawBody||JSON.stringify(req.body||{});const expected="sha256="+crypto.createHmac("sha256",c.appSecret).update(raw).digest("hex");const got=Buffer.from(String(signature));const exp=Buffer.from(expected);if(got.length!==exp.length||!crypto.timingSafeEqual(got,exp))return res.status(401).send("Invalid signature");}try{const s=ensureStoreShape(readStore());for(const entry of (req.body?.entry||[])){for(const change of (entry.changes||[])){const value=change.value||{};for(const m of (value.messages||[])){const from=m.from||"";const text=m.text?.body||m.button?.text||m.interactive?.button_reply?.title||"";const client=s.clients.find(x=>x.clientWhatsApp&&String(x.clientWhatsApp).replace(/\D/g,"").endsWith(String(value.metadata?.display_phone_number||"").replace(/\D/g,"")))||s.clients.find(x=>x.clientWhatsApp)||s.clients[0];if(client&&text){activity(s,client.id,"whatsapp",`Incoming WhatsApp message from ${from}: ${text.slice(0,180)}`,{from,text,messageId:m.id||null});}}}}writeStore(s);res.sendStatus(200);}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/whatsapp/webhook",(req,res)=>{const c=waConfig();const signature=req.headers["x-hub-signature-256"];if(c.appSecret&&signature){const raw=req.rawBody||JSON.stringify(req.body||{});const expected="sha256="+crypto.createHmac("sha256",c.appSecret).update(raw).digest("hex");const got=Buffer.from(String(signature));const exp=Buffer.from(expected);if(got.length!==exp.length||!crypto.timingSafeEqual(got,exp))return res.status(401).send("Invalid signature");}try{const s=ensureStoreShape(readStore());for(const entry of (req.body?.entry||[])){for(const change of (entry.changes||[])){const value=change.value||{};for(const m of (value.messages||[])){const from=m.from||"";const text=m.text?.body||m.button?.text||m.interactive?.button_reply?.title||"";const client=s.clients.find(x=>x.clientWhatsApp&&String(x.clientWhatsApp).replace(/\D/g,"").endsWith(String(value.metadata?.display_phone_number||"").replace(/\D/g,"")))||s.clients.find(x=>x.clientWhatsApp)||s.clients[0];if(client&&text){activity(s,client.id,"whatsapp",`Incoming WhatsApp message from ${from}: ${text.slice(0,180)}`,{from,text,messageId:m.id||null});pushThreadMessage(s,client.id,from,{direction:"in",text,at:reNow(),messageId:m.id||null});}}}}writeStore(s);res.sendStatus(200);}catch(e){res.status(500).json({error:e.message});}});
+
+app.get("/api/whatsapp/inbox",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const threads=Object.values(s.whatsappThreads[id]||{});const out=threads.map(t=>{const lead=t.leadId?s.leads.find(l=>l.id===t.leadId&&l.clientId===id):null;const last=t.messages[t.messages.length-1];return {phone:t.phone,leadId:t.leadId,leadName:lead?.name||null,lastMessage:last?.text||"",lastDirection:last?.direction||null,lastMessageAt:t.lastMessageAt,unread:!!t.unread};}).sort((a,b)=>new Date(b.lastMessageAt)-new Date(a.lastMessageAt));res.json(out);}catch(e){res.status(403).json({error:e.message});}});
+app.get("/api/whatsapp/inbox/:phone",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const key=threadKey(req.params.phone);const t=(s.whatsappThreads[id]||{})[key];if(!t)return res.status(404).json({error:"No conversation found for this number."});if(t.unread){t.unread=false;writeStore(s);}res.json(t);}catch(e){res.status(403).json({error:e.message});}});
+app.post("/api/whatsapp/inbox/reply",requireAuth,rateLimit("wa-reply",60,60000),async(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const phone=String(req.body.phone||"");const text=String(req.body.text||"").trim();if(!phone||!text)return res.status(400).json({error:"phone and text are required"});const key=threadKey(phone);const t=(s.whatsappThreads[id]||{})[key];const lastInbound=[...(t?.messages||[])].reverse().find(m=>m.direction==="in");const withinWindow=lastInbound&&(Date.now()-new Date(lastInbound.at).getTime())<24*60*60*1000;if(!withinWindow)return res.status(400).json({error:"More than 24 hours since this contact's last message — WhatsApp requires an approved template outside that window. Use Send Template instead."});const out=await sendWhatsAppText(phone,text);const s2=ensureStoreShape(readStore());pushThreadMessage(s2,id,phone,{direction:"out",text,at:reNow(),messageId:out.messageId});writeStore(s2);res.json({ok:true,messageId:out.messageId});}catch(e){res.status(502).json({error:e.message});}});
 
 // ---------- Real Estate Automation / Revenue Intelligence v2 ----------
-app.get("/api/realestate/automation",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);if(req.session.user?.role!=="admin"&&!planHasFeature(clientPlanTier(s,id),"automation"))return res.status(403).json({error:"The automation engine requires the Premium plan."});const a=clientAutomation(s,id);writeStore(s);const leads=s.leads.filter(x=>x.clientId===id);const follow=s.realEstate.followups.filter(x=>x.clientId===id);const uncontacted=leads.filter(x=>x.pipelineStage==="NEW");const queued=follow.filter(x=>x.status==="queued");res.json({config:a,uncontacted:uncontacted.length,missed:uncontacted.filter(x=>x.missedLeadAt).length,escalated:uncontacted.filter(x=>x.escalatedAt).length,followups:{pending:follow.filter(x=>x.status==="pending").length,queued:queued.length,completed:follow.filter(x=>x.status==="completed").length},queue:queued.slice(0,100)});}catch(e){res.status(403).json({error:e.message});}});
+app.get("/api/realestate/automation",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);if(req.session.user?.role!=="admin"&&!planHasFeature(clientPlanTier(s,id),"automation"))return res.status(403).json({error:"The automation engine requires the Premium plan."});const a=clientAutomation(s,id);writeStore(s);const leads=s.leads.filter(x=>x.clientId===id);const follow=s.realEstate.followups.filter(x=>x.clientId===id);const uncontacted=leads.filter(x=>x.pipelineStage==="NEW");const queued=follow.filter(x=>x.status==="queued");const wa=waConfig();res.json({config:a,waAutomatedFollowups:!!(wa.phoneNumberId&&wa.accessToken&&wa.followupTemplate),uncontacted:uncontacted.length,missed:uncontacted.filter(x=>x.missedLeadAt).length,escalated:uncontacted.filter(x=>x.escalatedAt).length,followups:{pending:follow.filter(x=>x.status==="pending").length,queued:queued.length,sent:follow.filter(x=>x.status==="sent").length,completed:follow.filter(x=>x.status==="completed").length,failed:follow.filter(x=>x.status==="queued"&&x.lastSendError).length},queue:queued.slice(0,100)});}catch(e){res.status(403).json({error:e.message});}});
 app.post("/api/realestate/automation",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);if(req.session.user?.role!=="admin"&&!planHasFeature(clientPlanTier(s,id),"automation"))return res.status(403).json({error:"The automation engine requires the Premium plan."});const a=clientAutomation(s,id);if(req.body.missedLeadMinutes!==undefined)a.missedLeadMinutes=Math.max(1,Number(req.body.missedLeadMinutes)||10);if(req.body.escalationMinutes!==undefined)a.escalationMinutes=Math.max(a.missedLeadMinutes+1,Number(req.body.escalationMinutes)||30);if(req.body.autoAssign!==undefined)a.autoAssign=!!req.body.autoAssign;if(Array.isArray(req.body.followups))a.followups=req.body.followups.slice(0,20).map(x=>({id:String(x.id||reId("rule")),day:Math.max(0,Number(x.day)||0),stage:String(x.stage||"lead"),channel:String(x.channel||"whatsapp"),message:String(x.message||"").slice(0,1000)})).filter(x=>x.message);s.realEstate.automationByClient[id]=a;activity(s,id,"automation","Automation settings updated");writeStore(s);res.json(a);}catch(e){res.status(403).json({error:e.message});}});
 app.post("/api/realestate/automation/run",requireAuth,(req,res)=>{try{const s0=ensureStoreShape(readStore()),id0=reClient(req,s0);if(req.session.user?.role!=="admin"&&!planHasFeature(clientPlanTier(s0,id0),"automation"))return res.status(403).json({error:"The automation engine requires the Premium plan."});processRealEstateAutomation();const s=ensureStoreShape(readStore()),id=reClient(req,s);res.json({ok:true,clientId:id,ranAt:reNow()});}catch(e){res.status(403).json({error:e.message});}});
 app.get("/api/realestate/activity",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const leadId=req.query.leadId;res.json(s.realEstate.activities.filter(x=>x.clientId===id&&(!leadId||x.meta?.leadId===leadId)).slice(0,200));}catch(e){res.status(403).json({error:e.message});}});
@@ -571,7 +739,58 @@ async function sendWeeklyReport(clientId){const s=ensureStoreShape(readStore());
 function escapeHtml(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));}
 app.post("/api/reports/send",requireAuth,async(req,res)=>{try{const s=readStore();const id=selectedClient(req,s);res.json(await sendWeeklyReport(id));}catch(e){res.status(500).json({error:e.message});}});
 
-setInterval(async()=>{try{const s=ensureStoreShape(readStore());for(const c of s.clients){const cs=clientSettings(s,c.id);if(!cs.reportEnabled||!cs.reportEmail||!process.env.SMTP_HOST)continue;const last=s.reportHistory.find(x=>x.clientId===c.id);if(!last||Date.now()-new Date(last.sentAt).getTime()>=7*864e5)await sendWeeklyReport(c.id);}}catch(e){console.error("ASSISTQ report scheduler",e.message);}},60*60*1000);
+// BUG FIX: this used to also require process.env.SMTP_HOST before even
+// attempting a send — but sendWeeklyReport() already prefers the client's
+// connected Gmail account (the documented, primary path in
+// SETUP_FOR_CLIENT.md) and only falls back to SMTP. That meant any client
+// who connected Google (instead of configuring SMTP) had automatic weekly
+// reports silently do nothing, forever — "Send report now" worked because
+// it calls sendWeeklyReport() directly, but the hourly scheduler never
+// reached it. sendWeeklyReport() already returns {ok:false,reason} instead
+// of throwing when neither Gmail nor SMTP is available, so it's safe to
+// just let it try and check its own result.
+setInterval(async()=>{
+  try{
+    const s=ensureStoreShape(readStore());
+    for(const c of s.clients){
+      const cs=clientSettings(s,c.id);
+      if(!cs.reportEnabled||!cs.reportEmail)continue;
+      const last=s.reportHistory.find(x=>x.clientId===c.id);
+      if(!last||Date.now()-new Date(last.sentAt).getTime()>=7*864e5){
+        const out=await sendWeeklyReport(c.id);
+        if(!out.ok)console.error(`ASSISTQ report scheduler: skipped ${c.id} — ${out.reason}`);
+      }
+    }
+  }catch(e){console.error("ASSISTQ report scheduler",e.message);}
+},60*60*1000);
+
+// NEW: recurring SEO audits for Growth/Premium clients, so "SEO health...
+// monitored every month" (the marketing promise) is actually true instead
+// of only updating when someone happens to click "Run audit" in the
+// dashboard. Starter has no dashboard, so there's nothing for it to show
+// an audit in — skipped on purpose, not an oversight.
+setInterval(async()=>{
+  try{
+    const s=ensureStoreShape(readStore());
+    for(const c of s.clients){
+      const plan=String(c.plan||"Starter").toLowerCase().trim();
+      if(plan==="starter")continue;
+      const cs=clientSettings(s,c.id);
+      const website=String(cs.website||c.website||"").trim();
+      if(!website)continue;
+      const existing=s.seoAudits[c.id];
+      if(existing&&Date.now()-new Date(existing.checkedAt).getTime()<7*864e5)continue;
+      try{
+        const audit=await runSeoAudit(website);
+        const s2=ensureStoreShape(readStore());
+        s2.seoAudits[c.id]=audit;
+        writeStore(s2);
+        activity(s2,c.id,"seo",`Automatic monthly SEO audit completed — score ${audit.score}/100`,{});
+        writeStore(s2);
+      }catch(err){console.error(`ASSISTQ auto SEO audit failed for ${c.id}:`,err.message);}
+    }
+  }catch(e){console.error("ASSISTQ SEO audit scheduler",e.message);}
+},6*60*60*1000);
 
 app.use((req,res,next)=>{if(req.method!=="GET")return next();if(req.path.startsWith("/api/")||req.path.startsWith("/auth/"))return res.status(404).end();res.sendFile(path.join(__dirname,"public","index.html"));});
 
