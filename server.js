@@ -77,14 +77,16 @@ const rateBuckets=new Map();
 function rateLimit(key,limit=30,windowMs=60000){return (req,res,next)=>{const now=Date.now(),ip=req.ip||req.socket.remoteAddress||"unknown",k=key+"|"+ip;const a=rateBuckets.get(k)||[];const fresh=a.filter(t=>now-t<windowMs);if(fresh.length>=limit)return res.status(429).json({error:"Too many requests. Please try again shortly."});fresh.push(now);rateBuckets.set(k,fresh);next();};}
 setInterval(()=>{const now=Date.now();for(const [k,a] of rateBuckets)if(!a.some(t=>now-t<60000))rateBuckets.delete(k);},60000);
 
-// Public chatbot bridge. Production deployments should set WEBHOOK_SECRET.
-app.use((req,res,next)=>{
-  if(req.path.startsWith("/api/bridge")||req.path==="/api/leads"||req.path==="/api/public/client-config"){
-    const origin=req.headers.origin;res.setHeader("Access-Control-Allow-Origin",origin||"*");res.setHeader("Vary","Origin");res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");res.setHeader("Access-Control-Allow-Headers","Content-Type, X-AssistQ-Secret");
-    if(req.method==="OPTIONS")return res.sendStatus(204);
-  }
-  next();
-});
+   // Public chatbot bridge, and the public checkout page (payment.html lives on
+   // a different domain — www.assistq.in — than this API, so without this it
+   // gets silently blocked by the browser before the request even arrives here).
+   app.use((req,res,next)=>{
+     if(req.path.startsWith("/api/bridge")||req.path==="/api/leads"||req.path==="/api/public/client-config"||req.path==="/api/billing/create-subscription"||req.path==="/api/billing/verify"){
+       const origin=req.headers.origin;res.setHeader("Access-Control-Allow-Origin",origin||"*");res.setHeader("Vary","Origin");res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");res.setHeader("Access-Control-Allow-Headers","Content-Type, X-AssistQ-Secret");
+       if(req.method==="OPTIONS")return res.sendStatus(204);
+     }
+     next();
+   });
 app.use(express.static(path.join(__dirname,"public")));
 
 function normaliseClientId(id){return String(id||"demo-realty").toLowerCase().replace(/[^a-z0-9_-]/g,"-").slice(0,60)||"demo-realty";}
