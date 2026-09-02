@@ -7,7 +7,7 @@ import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import nodemailer from "nodemailer";
 import Razorpay from "razorpay";
-import { initDB, readStore, writeStore } from "./db.js";
+import { initDB, readStore, writeStore, flushPendingWrites } from "./db.js";
 
 dotenv.config();
 const __dirname=path.dirname(fileURLToPath(import.meta.url));
@@ -77,6 +77,39 @@ app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");if(re
 const rateBuckets=new Map();
 function rateLimit(key,limit=30,windowMs=60000){return (req,res,next)=>{const now=Date.now(),ip=req.ip||req.socket.remoteAddress||"unknown",k=key+"|"+ip;const a=rateBuckets.get(k)||[];const fresh=a.filter(t=>now-t<windowMs);if(fresh.length>=limit)return res.status(429).json({error:"Too many requests. Please try again shortly."});fresh.push(now);rateBuckets.set(k,fresh);next();};}
 setInterval(()=>{const now=Date.now();for(const [k,a] of rateBuckets)if(!a.some(t=>now-t<60000))rateBuckets.delete(k);},60000);
+
+// Baseline abuse protection: previously only a handful of specific routes
+// (login, billing, etc.) had any rate limiting at all — every other
+// endpoint, including expensive ones (SEO crawling, keyword sync, sending
+// a WhatsApp template — which costs money per message), had none. This
+// applies a generous per-IP ceiling to every /api/ route as a safety net;
+// routes with their own tighter limit (login, billing-create, etc.) keep
+// that stricter limit layered on top, since it runs first as their own
+// route-level middleware. Genuine users never come close to this; a
+// scripted attacker or a runaway integration does.
+// Webhooks are deliberately excluded: Meta/Razorpay send from their own
+// shared infrastructure IPs, and a burst of legitimate events for many
+// different clients could plausibly come from the same IP in a short
+// window. Those are already protected the correct way — signature
+// verification — not by per-IP counting.
+const globalApiLimiter=rateLimit("global-api",300,60000);
+app.use((req,res,next)=>{
+  if(req.path==="/api/whatsapp/webhook"||req.path==="/api/billing/webhook")return next();
+  if(req.path.startsWith("/api/"))return globalApiLimiter(req,res,next);
+  next();
+});
+
+// HTTPS is normally enforced at Railway's edge before a request ever
+// reaches this process, but this adds the same guarantee at the
+// application level too — defense in depth in case that ever changes,
+// costs nothing for requests that are already HTTPS (the common case).
+app.use((req,res,next)=>{
+  if(process.env.NODE_ENV==="production"&&req.headers["x-forwarded-proto"]&&req.headers["x-forwarded-proto"]!=="https"){
+    return res.redirect(301,`https://${req.headers.host}${req.originalUrl}`);
+  }
+  if(process.env.NODE_ENV==="production")res.setHeader("Strict-Transport-Security","max-age=15552000; includeSubDomains");
+  next();
+});
 
 // Public chatbot bridge, and the public checkout page (payment.html lives on
 // a different domain — www.assistq.in — than this API, so without this it
@@ -693,7 +726,15 @@ app.post("/api/seo/audit",requireAuth,rateLimit("seo",20,60000),async(req,res)=>
 function reClient(req,s){const id=selectedClient(req,s);if(req.session.user?.role!=="admin"&&req.session.user?.clientId!==id)throw new Error("Workspace access denied");return id;}
 function reId(prefix){return prefix+"_"+crypto.randomBytes(5).toString("hex");}
 function reNow(){return new Date().toISOString();}
-function activity(s,clientId,type,text,meta={},actor=null){s.realEstate.activities.unshift({id:reId("act"),clientId,type,text:actor?`${text} — by ${actor}`:text,meta,at:reNow()});s.realEstate.activities=s.realEstate.activities.slice(0,500);}
+// Used to cap the WHOLE activity log at 500 entries combined across every
+// client — meaning one busy client's activity could push every OTHER
+// client's older activity out of existence. Now caps per client (300 each)
+// — every other client's entries are left completely untouched.
+function activity(s,clientId,type,text,meta={},actor=null){
+  s.realEstate.activities.unshift({id:reId("act"),clientId,type,text:actor?`${text} — by ${actor}`:text,meta,at:reNow()});
+  let kept=0;
+  s.realEstate.activities=s.realEstate.activities.filter(a=>{if(a.clientId!==clientId)return true;kept++;return kept<=300;});
+}
 function enrichLead(l,s){const visits=s.realEstate.visits.filter(v=>v.clientId===l.clientId&&v.leadId===l.id);const f=s.realEstate.followups.filter(v=>v.clientId===l.clientId&&v.leadId===l.id);const team=s.realEstate.team.find(t=>t.clientId===l.clientId&&t.id===l.assignedTo);return {...l,visits,followups:f,assignedUser:team||null};}
 function leadById(s,id,clientId){return s.leads.find(x=>x.id===id&&x.clientId===clientId);}
 app.get("/api/realestate/summary",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const leads=s.leads.filter(x=>x.clientId===id);const visits=s.realEstate.visits.filter(x=>x.clientId===id);const team=s.realEstate.team.filter(x=>x.clientId===id);const bookings=leads.filter(x=>x.pipelineStage==="BOOKING").length;const qualified=leads.filter(x=>x.score>=50).length;const contacted=leads.filter(x=>["CONTACTED","INTERESTED","SITE_VISIT_SCHEDULED","SITE_VISIT_COMPLETED","NEGOTIATION","BOOKING"].includes(x.pipelineStage)).length;const scheduled=visits.filter(x=>x.status==="scheduled").length;const completed=visits.filter(x=>x.status==="completed").length;const negotiation=leads.filter(x=>x.pipelineStage==="NEGOTIATION").length;const bySource={};for(const l of leads){const key=l.source||"Direct";bySource[key]??={leads:0,qualified:0,visits:0,bookings:0};bySource[key].leads++;if(l.score>=50)bySource[key].qualified++;if(visits.some(v=>v.leadId===l.id&&v.status==="completed"))bySource[key].visits++;if(l.pipelineStage==="BOOKING")bySource[key].bookings++;}res.json({clientId:id,counts:{leads:leads.length,qualified,contacted,scheduled,completed,negotiation,bookings},bySource,team:team.map(t=>{const tl=leads.filter(l=>l.assignedTo===t.id);return {...t,leads:tl.length,contacted:tl.filter(l=>l.pipelineStage!=="NEW").length,visits:visits.filter(v=>v.assignedTo===t.id&&v.status==="completed").length,bookings:tl.filter(l=>l.pipelineStage==="BOOKING").length,responseMinutes:tl.length?Math.round(tl.reduce((a,l)=>a+(l.responseMinutes||0),0)/tl.filter(l=>l.responseMinutes!=null).length||0):0};})});}catch(e){res.status(e.message.includes("access")?403:500).json({error:e.message});}});
@@ -909,7 +950,35 @@ app.use((req,res,next)=>{if(req.method!=="GET")return next();if(req.path.startsW
 setInterval(processRealEstateAutomation,60000);
 try {
   await initDB(defaultStore);
-  app.listen(PORT,()=>console.log(`ASSISTQ Growth Platform running on port ${PORT}`));
+  const server = app.listen(PORT,()=>console.log(`ASSISTQ Growth Platform running on port ${PORT}`));
+
+  // Without this, a redeploy could silently lose data: every write updates
+  // the in-memory copy immediately (so the same request's response reflects
+  // it) but the actual save to Postgres happens a moment later in the
+  // background — the HTTP response goes out before that save is confirmed.
+  // Railway sends SIGTERM to the old container the instant a new deploy
+  // takes over; without catching it, Node just dies mid-write, and
+  // whatever hadn't reached Postgres yet is gone for good. This makes
+  // shutdown wait for any in-flight writes to actually land first.
+  let shuttingDown = false;
+  async function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`ASSISTQ: received ${signal}, finishing pending writes before shutdown...`);
+    server.close(); // stop accepting new requests
+    try {
+      await Promise.race([
+        flushPendingWrites(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timed out after 8s")), 8000))
+      ]);
+      console.log("ASSISTQ: all pending writes confirmed. Shutting down cleanly.");
+    } catch (err) {
+      console.error("ASSISTQ: shutdown wait failed —", err.message, "(some very recent writes may not have been saved)");
+    }
+    process.exit(0);
+  }
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 } catch (err) {
   console.error("ASSISTQ: failed to start — could not connect to Postgres.");
   console.error(err.message);
