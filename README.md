@@ -1,4 +1,4 @@
-# ASSISTQ Growth Platform v8.1
+# ASSISTQ Growth Platform + Real Estate Conversion Engine v2 v8.1
 
 ASSISTQ by SonQAI Technologies — lead capture, AI conversation intelligence, UTM attribution, lead scoring, SEO audit, Search Console, GA4 and weekly reporting.
 
@@ -56,3 +56,6 @@ Renewing/reactivating keeps the same `clientId` and historical data. Use **Archi
 ## Production note
 
 The included JSON store is suitable for a local prototype / controlled deployment. For a multi-client public SaaS, move persistent data and OAuth tokens to a managed database and encrypted secret storage before launch.
+
+## Production correction note
+The current Railway build persists the application state in the `assistq_store` JSONB row managed by `db.js`. The SQL under `real_estate_phase_final/` is a future normalized-schema reference, not a migration to run blindly on the current production database.
