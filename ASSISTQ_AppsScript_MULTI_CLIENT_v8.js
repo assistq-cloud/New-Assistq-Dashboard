@@ -15,7 +15,7 @@
 const TEST_MODE = false;
 
 const CONFIG = {
-  dashboardUrl: "", // Optional fallback; set ASSISTQ_DASHBOARD_URL in Script Properties for production.
+  dashboardUrl: "https://assistq.in", // Fallback only; Script Properties should override this in production.
   clientEmail: "assistq1@gmail.com",
   clientWhatsApp: "918446242738",
   businessName: "ASSISTQ",
@@ -33,15 +33,15 @@ const CONFIG = {
     { key: "timeline", label: "When are you planning to move forward?" }
   ],
 
+  // Keep this generic. Client-specific knowledge is loaded securely from the
+  // AssistQ dashboard using the clientId, so a client's bot never accidentally
+  // answers with ASSISTQ's own pricing or business details.
   faq: `
-Q: What do you charge?
-A: INR 4999 for setup and INR 5999 for Monthly Retainer and we have another one as a Smart Form with INR 1999 for setup and INR 2999
+Q: What are the current prices or offers?
+A: I can have the team share the latest pricing and offers with you.
 
-Q: How fast can you setup?
-A: Within 48 hours
-
-Q: Do you serve Area?
-A: All over india as it is multiple business Friendly
+Q: Can I schedule a site visit?
+A: Yes. I can collect your details and the team can arrange a suitable time.
 `,
 
   // ---- WEIGHTED LEAD SCORING (out of 100) ----
@@ -219,9 +219,11 @@ Respond with ONLY valid JSON, no other text before or after it, in exactly this 
 Example of a correct response:
 {"reply": "Great, thanks! What's the best phone number to reach you?", "fields": {"name": "Anushka"}}`;
 
+  const model = PropertiesService.getScriptProperties().getProperty("ASSISTQ_CLAUDE_MODEL") || "claude-sonnet-5";
   const payload = {
-    model: "claude-sonnet-5",
-    max_tokens: 1024,
+    model: model,
+    max_tokens: 1600,
+    thinking: { type: "disabled" },
     system: systemPrompt,
     messages: data.messages
   };
@@ -235,10 +237,16 @@ Example of a correct response:
   });
 
   const raw = response.getContentText();
-  const result = JSON.parse(raw);
+  let result;
+  try {
+    result = JSON.parse(raw);
+  } catch (parseError) {
+    return { reply: "The AI service returned an unexpected response. Please try again.", fields: knownFields, complete: false };
+  }
 
-  if (result.error) {
-    return { reply: "AI error: " + result.error.message, fields: knownFields, complete: false };
+  if (response.getResponseCode() < 200 || response.getResponseCode() >= 300 || result.error) {
+    const message = result && result.error && result.error.message ? result.error.message : "HTTP " + response.getResponseCode();
+    return { reply: "AI service error: " + message, fields: knownFields, complete: false };
   }
 
   let parsed;
@@ -411,6 +419,9 @@ Tap to notify yourself on WhatsApp: ${waLink}`;
  * Shows, per traffic source: Leads (total) → Qualified (score 50+) → Hot (80+)
  */
 function createWeeklyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function(trigger) {
+    if (trigger.getHandlerFunction() === 'sendWeeklyReport') ScriptApp.deleteTrigger(trigger);
+  });
   ScriptApp.newTrigger('sendWeeklyReport')
     .timeBased()
     .onWeekDay(ScriptApp.WeekDay.SUNDAY)
