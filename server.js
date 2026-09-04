@@ -520,6 +520,15 @@ app.post("/api/google/test-email",requireAuth,requireGoogle,async(req,res)=>{try
 // ASSISTQ origin, follows redirects on the server, validates the upstream
 // response, and ALWAYS returns JSON to the widget.
 app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,async(req,res)=>{
+  // Browsers/older cached widgets may omit Content-Type. Recover JSON when possible
+  // instead of forwarding an empty body to Apps Script (which becomes action=undefined).
+  if(!req.body || typeof req.body!=="object" || Array.isArray(req.body)){
+    const raw=Buffer.isBuffer(req.body)?req.body.toString("utf8"):typeof req.body==="string"?req.body:"";
+    if(raw.trim()){try{req.body=JSON.parse(raw);}catch{}}
+  }
+  if(!req.body || !req.body.action){
+    return res.status(400).json({status:"error",message:"Chatbot request is missing action. Refresh the chatbot page to load the latest AssistQ widget."});
+  }
   const upstream=String(process.env.APPS_SCRIPT_WEBHOOK_URL||"").trim();
   if(!upstream)return res.status(503).json({status:"error",message:"Chatbot backend is not configured. Set APPS_SCRIPT_WEBHOOK_URL on the server."});
   if(!/^https:\/\/script\.google\.com\/macros\/s\//i.test(upstream))return res.status(500).json({status:"error",message:"APPS_SCRIPT_WEBHOOK_URL must be a deployed Google Apps Script /exec URL."});
