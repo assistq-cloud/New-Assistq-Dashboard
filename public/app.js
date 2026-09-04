@@ -1,6 +1,13 @@
 let S={page:"overview",data:null,dark:false,selectedConversation:null,selectedLead:null,user:null};
 const $=x=>document.querySelector(x);const esc=x=>String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));const pill=s=>`<span class="pill ${s==="HOT"?"hot":s==="WARM"?"warm":"cold"}">${esc(s)}</span>`;const k=(a,b,c)=>`<div class="card"><div class="label">${a}</div><div class="value">${b}</div><div class="trend">${c}</div></div>`;
-async function api(url,opt={}){const r=await fetch(url,{headers:{"Content-Type":"application/json",...(opt.headers||{})},...opt});const j=await r.json().catch(()=>({error:"Invalid response"}));if(!r.ok)throw new Error(j.error||"Request failed");return j}
+async function api(url,opt={}){
+  const r=await fetch(url,{headers:{"Content-Type":"application/json",...(opt.headers||{})},...opt});
+  const text=await r.text();
+  let j;
+  try{j=text?JSON.parse(text):{};}catch{throw new Error(`Server returned HTTP ${r.status} instead of JSON.`);}
+  if(!r.ok)throw new Error(j.error||j.message||`Request failed (HTTP ${r.status})`);
+  return j;
+}
 function clientId(){return localStorage.getItem("assistqClientId")||"demo-realty"}
 async function auth(){const a=await api("/api/auth/status");if(!a.authenticated){$("#login").classList.remove("hidden");$("#app").classList.add("hidden");return false;}S.user=a.user;$("#login").classList.add("hidden");$("#app").classList.remove("hidden");return true}
 async function load(){if(!(await auth()))return;try{S.data=await api(`/api/state?clientId=${encodeURIComponent(clientId())}`);renderTop();render();}catch(e){if(e.message.includes("Authentication"))return auth();toast(e.message)}}
