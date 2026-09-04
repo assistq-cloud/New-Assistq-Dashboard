@@ -669,6 +669,21 @@ document.getElementById("navChatBtn").addEventListener("click", openChat);
 sendBtn.addEventListener("click", () => sendMessage());
 textInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(); });
 
+function normaliseBotReply(value) {
+  if (value && typeof value === "object") {
+    return String(value.reply || value.message || value.text || "Got it, thanks!");
+  }
+  const text = String(value ?? "").trim();
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object") {
+      const nested = parsed.json && typeof parsed.json === "object" ? parsed.json : parsed;
+      return String(nested.reply || nested.message || nested.text || text);
+    }
+  } catch (_) {}
+  return text;
+}
+
 function addMessage(sender, text) {
   const div = document.createElement("div");
   div.className = "msg " + sender;
@@ -815,10 +830,11 @@ async function sendMessage(optionText) {
     }
 
     typingEl.remove();
-    addMessage("bot", data.reply);
-    conversation.push({ role: "assistant", content: data.reply });
+    const safeReply = normaliseBotReply(data.reply);
+    addMessage("bot", safeReply);
+    conversation.push({ role: "assistant", content: safeReply });
     knownFields = data.fields || knownFields;
-    bridgeEvent("assistant", data.reply);
+    bridgeEvent("assistant", safeReply);
 
     if (data.complete && !isComplete) {
       const missing = ["name", "phone", "email"].find(k => !String(knownFields[k] || "").trim());
