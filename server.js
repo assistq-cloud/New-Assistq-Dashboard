@@ -806,37 +806,117 @@ app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,as
 
 // ---------- Leads / chatbot bridge ----------
 function saveConversationEvent(body){const s=ensureStoreShape(readStore());const clientId=normaliseClientId(body.clientId||s.settings.clientId);const id=body.leadId||"lead_"+crypto.randomBytes(6).toString("hex");const now=new Date().toISOString();const existing=s.conversations[id]||{id,clientId,createdAt:now,updatedAt:now,fields:{},utm:{},messages:[],score:0,status:"COLD"};if(body.event?.role&&body.event?.content){const last=existing.messages.at(-1);if(!(last&&last.role===body.event.role&&last.content===body.event.content))existing.messages.push({role:body.event.role,content:String(body.event.content).slice(0,8000),at:body.event.at||now});}existing.fields={...existing.fields,...normaliseFields(body.fields||{})};existing.utm={...existing.utm,...cleanUTM(body.utm||{})};existing.clientId=clientId;existing.updatedAt=now;const cs=clientSettings(s,clientId);existing.score=scoreLead(existing.fields,existing.messages,cs);existing.scoreBreakdown=scoreBreakdown(existing.fields,existing.messages,cs);existing.status=statusFor(existing.score,cs);s.conversations[id]=existing;writeStore(s);return existing;}
-// Before this, matching was a raw substring check ("does the lead's text
-// literally contain this area word?"), so a rep tagged "Pune" never matched
-// a lead that said "Kharadi" — a locality inside Pune the rep just hadn't
-// typed out. There's no real fix for that without a proper India locality
-// database, which is out of scope here — so instead this scores every rep
-// by how MANY of their listed areas actually appear (agencies listing
-// specific localities, not just city names, now match correctly and the
-// best-covered rep wins ties, not just whichever rep happened to be first).
-// The bigger fix is what happens when NOTHING matches: it used to always
-// fall back to reps[0] — meaning whoever was first on the list silently
-// absorbed every unmatched lead forever. Now it round-robins instead, so
-// unmatched leads spread fairly across the team.
+// Geographic territory routing.
+// Salespeople can be configured at either CITY level (e.g. "Pune") or
+// LOCALITY level (e.g. "Kharadi"). A lead mentioning "Kharadi" is therefore
+// recognised as a Pune lead even when the lead never explicitly says "Pune".
+// Direct locality matches score highest; city/parent-territory matches score
+// next; only genuinely unknown locations fall back to round-robin.
+const TERRITORY_GROUPS = {
+  "Pune": ["pune","pcmc","pimpri","pimpri-chinchwad","kharadi","viman nagar","viman nagar","hadapsar","wagholi","koregaon park","kalyani nagar","yerawada","baner","balewadi","aundh","wakad","hinjawadi","hinjewadi","kothrud","bavdhan","pashan","magarpatta","camp","kondhwa","nibm","wanowrie","dhayari","warje","karve nagar","pimple saudagar","pimple nilakh","pimple gurav","ravet","tathawade","moshi","chakan","talegaon","lohegaon","vishrantwadi","dhanori"],
+  "Mumbai": ["mumbai","south mumbai","andheri","bandra","powai","borivali","kandivali","malad","goregaon","jogeshwari","vile parle","santacruz","khar","ghatkopar","mulund","bhandup","chembur","kurla","sion","matunga","dadar","prabhadevi","lower parel","worli","parel","byculla","mazgaon","colaba","fort","marine lines","juhu","versova","goregaon east","goregaon west"],
+  "Navi Mumbai": ["navi mumbai","vashi","nerul","belapur","kharghar","panvel","airoli","ghansoli","kopar khairane","sanpada","seawoods","seawood","ulwe","taloja","kamothe","kalamboli","khandeshwar","new panvel","dronagiri","juinagar","turbhe","rabale","diwale","roadpali"],
+  "Thane": ["thane","ghodbunder","manpada","majiwada","wagle estate","kolshet","balkum","kalwa","naupada","hiranandani estate","pokhran","vartak nagar","kasarvadavali","owale","brahmand"],
+  "Bengaluru": ["bengaluru","bangalore","whitefield","electronic city","sarjapur","sarjapur road","marathahalli","indiranagar","koramangala","hebbal","yelahanka","jp nagar","jayanagar","hsr layout","bellandur","devanahalli","thanisandra","kr puram","varthur","banashankari"],
+  "Hyderabad": ["hyderabad","gachibowli","hitech city","hi-tech city","madhapur","kondapur","kokapet","financial district","narsingi","tellapur","manikonda","jubilee hills","banjara hills","kompally","secunderabad","uppal","lb nagar"],
+  "Delhi": ["delhi","new delhi","dwarka","rohini","pitampura","janakpuri","vasant kunj","saket","greater kailash","gurgaon","gurugram","noida","greater noida","ghaziabad","faridabad"],
+  "Gurgaon": ["gurgaon","gurugram","golf course road","sohna road","new gurgaon","dwarka expressway","mg road","sector 14","sector 49","sector 57","sector 65","sector 67","sector 70","manesar"],
+  "Noida": ["noida","greater noida","sector 15","sector 18","sector 50","sector 62","sector 74","sector 75","sector 76","sector 137","sector 143","sector 150","yamuna expressway"],
+  "Chennai": ["chennai","omr","old mahabalipuram road","ecr","adyar","velachery","porur","sholinganallur","perungudi","tambaram","anna nagar","t nagar","guindy","medavakkam"],
+  "Ahmedabad": ["ahmedabad","sg highway","sg highway","bopal","south bopal","shela","prahlad nagar","satellite","thaltej","vaishnodevi","gift city","gandhinagar","chandkheda","motera"],
+  "Kolkata": ["kolkata","new town","salt lake","rajarhat","behala","ballygunge","tollygunge","dum dum","alipore","howrah"],
+  "Jaipur": ["jaipur","vaishali nagar","malviya nagar","mansarovar","jagatpura","tonk road","ajmer road","c-scheme","vidhyadhar nagar"],
+  "Goa": ["goa","panaji","panjim","porvorim","mapusa","calangute","candolim","vasco da gama","margao","south goa","north goa"]
+};
+
+const TERRITORY_INDEX = (() => {
+  const out = {};
+  for (const [city, aliases] of Object.entries(TERRITORY_GROUPS)) {
+    for (const alias of aliases) {
+      const k = normaliseTerritory(alias);
+      if (k) out[k] = city;
+    }
+  }
+  return out;
+})();
+
+function normaliseTerritory(value="") {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function territoryContains(text, phrase) {
+  const t = normaliseTerritory(text), p = normaliseTerritory(phrase);
+  if (!t || !p) return false;
+  const re = new RegExp(`(^|\\s)${p.split(" ").map(x=>x.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("\\s+")}(?=\\s|$)`, "i");
+  return re.test(t);
+}
+function territoryCitiesMentioned(text) {
+  const found = new Set();
+  for (const [city, aliases] of Object.entries(TERRITORY_GROUPS)) {
+    if (aliases.some(a => territoryContains(text, a))) found.add(city);
+  }
+  return found;
+}
+function repTerritoryScore(rep, leadText) {
+  const text = String(leadText || "");
+  const repAreas = Array.isArray(rep.areas) ? rep.areas : [];
+  let score = 0;
+  for (const area of repAreas) {
+    const a = normaliseTerritory(area);
+    if (!a) continue;
+
+    // Exact configured area/locality match is strongest.
+    if (territoryContains(text, a)) {
+      // A specific locality (Kharadi) is more specific than a parent city
+      // (Pune). This lets a Kharadi specialist win over a general Pune rep
+      // when the lead says "Kharadi, Pune".
+      const isParentCity = Object.keys(TERRITORY_GROUPS).some(city => normaliseTerritory(city) === a);
+      score = Math.max(score, isParentCity ? 80 : 100);
+      continue;
+    }
+
+    // If the rep configured a city, any known locality in that city counts.
+    const parentCity = TERRITORY_INDEX[a];
+    if (parentCity) {
+      const mentionedCities = territoryCitiesMentioned(text);
+      if (mentionedCities.has(parentCity)) score = Math.max(score, 80);
+    }
+
+    // If the rep configured a locality, map the lead locality to its city and
+    // allow the parent city to confirm the match (e.g. "Kharadi, Pune").
+    const leadCities = territoryCitiesMentioned(text);
+    if (leadCities.has(a)) score = Math.max(score, 80);
+  }
+  return score;
+}
 function pickRep(s, clientId, reps, text) {
   if (!reps.length) return null;
-  const words = String(text || "").toLowerCase();
-  let best = null, bestScore = 0;
+  let best = null, bestScore = 0, bestCoverage = -1;
   for (const rep of reps) {
-    const score = (rep.areas || []).filter(a => a && words.includes(String(a).toLowerCase().trim())).length;
-    if (score > bestScore) { bestScore = score; best = rep; }
+    const score = repTerritoryScore(rep, text);
+    const coverage = Array.isArray(rep.areas) ? rep.areas.length : 0;
+    if (score > bestScore || (score === bestScore && score > 0 && coverage > bestCoverage)) {
+      best = rep; bestScore = score; bestCoverage = coverage;
+    }
   }
-  if (best) return best;
+  if (bestScore > 0) return best;
+
+  // Unknown/unmapped locations are still assigned, but fairly.
   s.realEstate.roundRobin = s.realEstate.roundRobin || {};
   const idx = (s.realEstate.roundRobin[clientId] || 0) % reps.length;
   s.realEstate.roundRobin[clientId] = idx + 1;
   return reps[idx];
 }
 function autoAssignLead(s,clientId,l){
+
   if(!planHasFeature(clientPlanTier(s,clientId),"team")) return null; // salesperson auto-assignment is a Premium feature
   const cfg=clientAutomation(s,clientId); if(cfg.autoAssign===false || l.assignedTo) return null;
   const reps=s.realEstate.team.filter(t=>t.clientId===clientId&&t.active!==false); if(!reps.length) return null;
-  const text=String(l.requirement||"");
+  const text=String(l.location||"")+" "+String(l.requirement||"");
   const match=pickRep(s,clientId,reps,text);
   l.assignedTo=match.id; l.assignedAt=reNow(); activity(s,clientId,"assignment",`${l.name} automatically assigned to ${match.name}`,{leadId:l.id,repId:match.id}); return match;
 }
@@ -914,7 +994,7 @@ function findPossibleDuplicate(s,clientId,phone,email,excludeId){
   if(!p&&!e)return null;
   return s.leads.find(x=>x.clientId===clientId&&x.id!==excludeId&&!x.mergedInto&&((p&&normPhone(x.phone)===p)||(e&&normEmail(x.email)===e)))||null;
 }
-function saveLeadInternal(body){const s=ensureStoreShape(readStore());const clientId=normaliseClientId(body.clientId||s.settings.clientId);const cs=clientSettings(s,clientId);const fields=normaliseFields(body.fields||{});const messages=Array.isArray(body.messages)?body.messages:[];const score=Number(body.score??scoreLead(fields,messages,cs));const status=statusFor(score,cs);const utm=cleanUTM(body.utm||{});const lead={clientId,id:body.id||body.leadId||"AQ-"+crypto.randomBytes(4).toString("hex").toUpperCase(),name:body.name||fields.name||"Unknown",phone:body.phone||fields.phone||"",email:body.email||fields.email||"",requirement:body.requirement||[fields.purpose,fields.location,fields.configuration].filter(Boolean).join(" · "),budget:body.budget||fields.budget||"",score,scoreBreakdown:scoreBreakdown(fields,messages,cs),status,source:body.utm_source||utm.source||"Direct",medium:body.utm_medium||utm.medium||"",campaign:body.utm_campaign||utm.campaign||"",utm,conversationId:body.conversationId||body.leadId||null,messagesCount:messages.length,date:new Date().toISOString(),pipelineStage:body.pipelineStage||"NEW",assignedTo:body.assignedTo||null,notes:String(body.notes||"").slice(0,5000),responseMinutes:body.responseMinutes==null?null:Number(body.responseMinutes)||0,updatedAt:new Date().toISOString()};const idx=s.leads.findIndex(x=>x.id===lead.id&&x.clientId===clientId);if(idx>=0)s.leads[idx]={...s.leads[idx],...lead};else {const dup=findPossibleDuplicate(s,clientId,lead.phone,lead.email,lead.id);if(dup){lead.possibleDuplicateOf=dup.id;activity(s,clientId,"duplicate",`Possible duplicate: ${lead.name} matches existing lead ${dup.name}`,{leadId:lead.id,matchedLeadId:dup.id});} s.leads.unshift(lead); autoAssignLead(s,clientId,lead); seedLeadFollowups(s,clientId,lead);}const key=`${clientId}|${lead.source}|${lead.medium}|${lead.campaign}`;s.utm[key]=(s.utm[key]||0)+1;if(lead.conversationId&&s.conversations[lead.conversationId])Object.assign(s.conversations[lead.conversationId],{score,status,fields,clientId,utm});writeStore(s);return lead;}
+function saveLeadInternal(body){const s=ensureStoreShape(readStore());const clientId=normaliseClientId(body.clientId||s.settings.clientId);const cs=clientSettings(s,clientId);const fields=normaliseFields(body.fields||{});const messages=Array.isArray(body.messages)?body.messages:[];const score=Number(body.score??scoreLead(fields,messages,cs));const status=statusFor(score,cs);const utm=cleanUTM(body.utm||{});const lead={clientId,id:body.id||body.leadId||"AQ-"+crypto.randomBytes(4).toString("hex").toUpperCase(),name:body.name||fields.name||"Unknown",phone:body.phone||fields.phone||"",email:body.email||fields.email||"",requirement:body.requirement||[fields.purpose,fields.location,fields.configuration].filter(Boolean).join(" · "),budget:body.budget||fields.budget||"",score,scoreBreakdown:scoreBreakdown(fields,messages,cs),status,source:body.utm_source||utm.source||"Direct",medium:body.utm_medium||utm.medium||"",campaign:body.utm_campaign||utm.campaign||"",utm,conversationId:body.conversationId||body.leadId||null,messagesCount:messages.length,date:new Date().toISOString(),pipelineStage:body.pipelineStage||"NEW",location:fields.location||body.location||"",assignedTo:body.assignedTo||null,notes:String(body.notes||"").slice(0,5000),responseMinutes:body.responseMinutes==null?null:Number(body.responseMinutes)||0,updatedAt:new Date().toISOString()};const idx=s.leads.findIndex(x=>x.id===lead.id&&x.clientId===clientId);if(idx>=0){s.leads[idx]={...s.leads[idx],...lead}; if(!s.leads[idx].assignedTo) autoAssignLead(s,clientId,s.leads[idx]);}else {const dup=findPossibleDuplicate(s,clientId,lead.phone,lead.email,lead.id);if(dup){lead.possibleDuplicateOf=dup.id;activity(s,clientId,"duplicate",`Possible duplicate: ${lead.name} matches existing lead ${dup.name}`,{leadId:lead.id,matchedLeadId:dup.id});} s.leads.unshift(lead); autoAssignLead(s,clientId,lead); seedLeadFollowups(s,clientId,lead);}const key=`${clientId}|${lead.source}|${lead.medium}|${lead.campaign}`;s.utm[key]=(s.utm[key]||0)+1;if(lead.conversationId&&s.conversations[lead.conversationId])Object.assign(s.conversations[lead.conversationId],{score,status,fields,clientId,utm});writeStore(s);return lead;}
 app.post("/api/leads",requireWebhookSecret,(req,res)=>{try{res.status(201).json({ok:true,lead:saveLeadInternal(req.body||{})});}catch(e){res.status(500).json({error:e.message});}});
 
 // Every real-estate CRM comparison names the same #1 requirement: auto-capture
@@ -1048,6 +1128,22 @@ app.post("/api/realestate/team/:id/login",requireAuth,(req,res)=>{try{requireOwn
 app.delete("/api/realestate/team/:id/login",requireAuth,(req,res)=>{try{requireOwner(req);const s=ensureStoreShape(readStore()),id=reClient(req,s);const t=s.realEstate.team.find(x=>x.id===req.params.id&&x.clientId===id);if(!t)return res.status(404).json({error:"Salesperson not found"});delete t.loginEmail;delete t.passwordHash;writeStore(s);res.json({ok:true});}catch(e){res.status(403).json({error:e.message});}});
 app.post("/api/realestate/assign",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);if(req.session.user?.role!=="admin"&&!planHasFeature(clientPlanTier(s,id),"team"))return res.status(403).json({error:"Salesperson assignment requires the Premium plan."});const l=leadById(s,req.body.leadId,id);if(!l)return res.status(404).json({error:"Lead not found"});const reps=s.realEstate.team.filter(t=>t.clientId===id&&t.active!==false);const loc=String(l.requirement||l.location||"");const match=pickRep(s,id,reps,loc);if(!match)return res.status(400).json({error:"Add at least one active salesperson first"});l.assignedTo=match.id;l.assignedAt=reNow();activity(s,id,"assignment",`${l.name} automatically assigned to ${match.name}`,{leadId:l.id,repId:match.id});writeStore(s);res.json(enrichLead(l,s));}catch(e){res.status(403).json({error:e.message});}});
 app.get("/api/realestate/visits",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);res.json(s.realEstate.visits.filter(x=>x.clientId===id).sort((a,b)=>new Date(a.date)-new Date(b.date)));}catch(e){res.status(403).json({error:e.message});}});
+// Assign all currently-unassigned leads using the same geographic routing
+// engine used for new leads. Useful after a client adds/configures their sales
+// team so existing enquiries are not left without an owner.
+app.post("/api/realestate/assign-unassigned",requireAuth,(req,res)=>{
+  try{
+    const s=ensureStoreShape(readStore()),id=reClient(req,s);
+    if(req.session.user?.role!=="admin"&&!planHasFeature(clientPlanTier(s,id),"team"))
+      return res.status(403).json({error:"Salesperson assignment requires the Premium plan."});
+    const reps=s.realEstate.team.filter(t=>t.clientId===id&&t.active!==false);
+    if(!reps.length)return res.status(400).json({error:"Add at least one active salesperson first"});
+    const unassigned=s.leads.filter(l=>l.clientId===id&&!l.mergedInto&&!l.assignedTo);
+    for(const l of unassigned) autoAssignLead(s,id,l);
+    writeStore(s);
+    res.json({ok:true,assigned:unassigned.filter(l=>l.assignedTo).length});
+  }catch(e){res.status(403).json({error:e.message});}
+});
 app.post("/api/realestate/visits",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);if(req.session.user?.role!=="admin"&&!planHasFeature(clientPlanTier(s,id),"visits"))return res.status(403).json({error:"Site visit scheduling requires the Growth plan or higher."});const l=leadById(s,req.body.leadId,id);if(!l)return res.status(404).json({error:"Lead not found"});const repId=staffScope(req);if(repId&&l.assignedTo!==repId)return res.status(403).json({error:"This lead isn't assigned to you."});const v={id:reId("visit"),clientId:id,leadId:l.id,projectId:req.body.projectId||null,date:String(req.body.date||""),time:String(req.body.time||""),assignedTo:req.body.assignedTo||l.assignedTo||null,status:"scheduled",notes:String(req.body.notes||"").slice(0,1000),createdAt:reNow()};if(!v.date||!v.time)return res.status(400).json({error:"Date and time are required"});s.realEstate.visits.push(v);l.pipelineStage="SITE_VISIT_SCHEDULED";l.updatedAt=reNow();activity(s,id,"visit",`${l.name} site visit scheduled for ${v.date} ${v.time}`,{leadId:l.id,visitId:v.id},actorName(req));writeStore(s);res.status(201).json(v);}catch(e){res.status(403).json({error:e.message});}});
 app.patch("/api/realestate/visits/:id",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s),v=s.realEstate.visits.find(x=>x.id===req.params.id&&x.clientId===id);if(!v)return res.status(404).json({error:"Visit not found"});const l=leadById(s,v.leadId,id);const repId=staffScope(req);if(repId&&l?.assignedTo!==repId)return res.status(403).json({error:"This lead isn't assigned to you."});if(req.body.status)v.status=req.body.status;if(l&&v.status==="completed")l.pipelineStage="SITE_VISIT_COMPLETED";if(l&&v.status==="cancelled")l.pipelineStage="CONTACTED";activity(s,id,"visit",`${l?.name||"Lead"} site visit ${v.status}`,{leadId:v.leadId,visitId:v.id},actorName(req));writeStore(s);res.json(v);}catch(e){res.status(403).json({error:e.message});}});
 app.get("/api/realestate/projects",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);res.json(s.realEstate.projects.filter(x=>x.clientId===id));}catch(e){res.status(403).json({error:e.message});}});
