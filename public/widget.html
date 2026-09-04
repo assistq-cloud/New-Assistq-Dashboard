@@ -126,7 +126,7 @@
 // public/chatbot.html's ?clientId=&dashboardUrl= support.
 const params = new URLSearchParams(window.location.search);
 const CONFIG = {
-  webhookUrl: params.get("webhookUrl") || "https://script.google.com/macros/s/AKfycbyZddoCVD7M1bnjFzmaP_6c_JdLr6T02z-PB_KC82-G1UQDSrVr08JpTo-StU37iGBT/exec",
+  webhookUrl: params.get("webhookUrl") || "",
   dashboardUrl: (params.get("dashboardUrl") || "https://assistq.in").replace(/\/$/, ""),
   clientId: params.get("clientId") || "",
   businessName: params.get("businessName") || "This Business",
@@ -142,6 +142,7 @@ const CONFIG = {
     { key: "timeline", options: ["Immediately", "1-3 months", "3-6 months", "Just exploring"] }
   ]
 };
+if (!CONFIG.webhookUrl && CONFIG.dashboardUrl) CONFIG.webhookUrl = CONFIG.dashboardUrl + "/api/chatbot";
 
 // Optional light re-brand via URL, e.g. &accent=%23c9573f&ink=%23150f04
 const accent = params.get("accent");
@@ -341,7 +342,7 @@ async function sendMessage(optionText) {
     const rawText = await res.text();
     let data;
     try { data = JSON.parse(rawText); } catch (parseErr) {
-      typingEl.remove(); addMessage("error", "Backend didn't return JSON. Raw response:\n" + rawText.slice(0, 300)); sendBtn.disabled = false; return;
+      typingEl.remove(); addMessage("error", "Chat service returned an invalid response. Please contact the site administrator."); sendBtn.disabled = false; return;
     }
     if (data.status === "error") { typingEl.remove(); addMessage("error", "Backend error: " + data.message); sendBtn.disabled = false; return; }
 
