@@ -8,7 +8,7 @@ import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import nodemailer from "nodemailer";
 import Razorpay from "razorpay";
-import { initDB, readStore, writeStore, flushPendingWrites } from "./db.js";
+import { initDB, readStore, writeStore, flushPendingWrites, getDBPool } from "./db.js";
 
 dotenv.config();
 const __dirname=path.dirname(fileURLToPath(import.meta.url));
@@ -71,7 +71,58 @@ function verifyPassword(password,stored){try{const [salt,hash]=String(stored).sp
 function checkAdminPassword(password,s){const storedHash=s.security?.adminPasswordHash;if(storedHash)return verifyPassword(password,storedHash);return String(password)===String(process.env.ADMIN_PASSWORD||"ChangeMe123!");}
 
 app.use(express.json({limit:"4mb",verify:(req,res,buf)=>{req.rawBody=Buffer.from(buf);}}));app.use(express.urlencoded({extended:true}));
-app.use(session({secret:process.env.SESSION_SECRET||"ASSISTQ-local-change-me",resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:7*24*60*60*1000}}));
+// Sessions are configured after Postgres initialization below. Railway's
+// default express-session MemoryStore is intentionally NOT used in production
+// because it loses every login when the container restarts/redeploys.
+function buildSessionStore() {
+  const Store = session.Store;
+  return new (class PostgresSessionStore extends Store {
+    async get(sid, cb) {
+      try {
+        const { rows } = await getDBPool().query(
+          "SELECT sess FROM assistq_sessions WHERE sid = $1 AND expire > now()", [sid]
+        );
+        cb(null, rows[0]?.sess || null);
+      } catch (e) { cb(e); }
+    }
+    async set(sid, sess, cb) {
+      try {
+        const ms = Number(sess.cookie?.maxAge || 7*24*60*60*1000);
+        const expire = new Date(Date.now() + Math.max(ms, 1000));
+        await getDBPool().query(
+          `INSERT INTO assistq_sessions (sid, sess, expire) VALUES ($1, $2::jsonb, $3)
+           ON CONFLICT (sid) DO UPDATE SET sess = EXCLUDED.sess, expire = EXCLUDED.expire`,
+          [sid, JSON.stringify(sess), expire]
+        );
+        cb(null);
+      } catch (e) { cb(e); }
+    }
+    async destroy(sid, cb) {
+      try { await getDBPool().query("DELETE FROM assistq_sessions WHERE sid = $1", [sid]); cb(null); }
+      catch (e) { cb(e); }
+    }
+    async touch(sid, sess, cb) {
+      try {
+        const ms = Number(sess.cookie?.maxAge || 7*24*60*60*1000);
+        const expire = new Date(Date.now() + Math.max(ms, 1000));
+        await getDBPool().query("UPDATE assistq_sessions SET expire = $2 WHERE sid = $1", [sid, expire]);
+        cb(null);
+      } catch (e) { cb(e); }
+    }
+  })();
+}
+
+let sessionStore = null;
+function configureSessions() {
+  sessionStore = buildSessionStore();
+  app.use(session({
+    store: sessionStore,
+    secret: process.env.SESSION_SECRET || "ASSISTQ-local-change-me",
+    resave: false,
+    saveUninitialized: false,
+    cookie: { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", maxAge: 7*24*60*60*1000 }
+  }));
+}
 
 // Basic production hardening. Put the app behind HTTPS in production.
 // NOTE: /widget.html is the embeddable chat-bubble widget — it is meant to
@@ -188,6 +239,29 @@ function planHasFeature(plan, feature) {
   if (plan === "growth") return ["visits", "documents", "testimonials"].includes(feature);
   return false; // starter
 }
+// ---------- Authentication / client-scope middleware ----------
+function requireAuth(req,res,next){
+  if(!req.session?.user) return res.status(401).json({error:"Authentication required"});
+  next();
+}
+function requireAdmin(req,res,next){
+  if(req.session?.user?.role!=="admin") return res.status(403).json({error:"Admin access required"});
+  next();
+}
+function selectedClient(req,s){
+  const user=req.session?.user;
+  if(user?.role && user.role!=="admin") return normaliseClientId(user.clientId||"");
+  const requested=req.query?.clientId||req.body?.clientId||req.assistqClientId||s.settings?.clientId;
+  return normaliseClientId(requested||"");
+}
+function clientPlanTier(s,id){
+  const c=(s.clients||[]).find(x=>x.id===id)||{};
+  const p=String(c.plan||"Starter").toLowerCase().trim();
+  if(p.includes("premium")) return "premium";
+  if(p.includes("growth")) return "growth";
+  return "starter";
+}
+
 function clientAutomation(s, clientId) {
   if (!s.realEstate.automationByClient[clientId]) {
     // Seed this client's own config from the shared template the first
@@ -261,7 +335,7 @@ function requireWebhookSecret(req,res,next){
   if(!secret && process.env.NODE_ENV==="production")return res.status(503).json({error:"WEBHOOK_SECRET is required in production"});
   next();
 }
-function whatsappUrl(phone,message=""){const digits=String(phone||"").replace(/\D/g,"");if(!digits)return "";const s=readStore();const cc=String(s.settings.whatsappCountryCode||"91");const full=digits.length===10?cc+digits:digits;return `https://wa.me/${full}?text=${encodeURIComponent(message)}`;}
+function whatsappUrl(phone,message="",clientId=""){const digits=String(phone||"").replace(/\D/g,"");if(!digits)return "";const s=ensureStoreShape(readStore());const c=s.clients.find(x=>x.id===normaliseClientId(clientId||""));const cc=String(c?.whatsappCountryCode||s.settings.whatsappCountryCode||"91");const full=digits.length===10?cc+digits:digits;return `https://wa.me/${full}?text=${encodeURIComponent(message)}`;}
 
 // ---------- Auth ----------
 app.get("/api/auth/status",(req,res)=>res.json({authenticated:!!req.session.user,user:req.session.user||null,googleConnected:!!req.session.tokens,googleEmail:req.session.googleEmail||null}));
@@ -333,7 +407,7 @@ app.get("/landing/:clientId",rateLimit("public-landing",120,60000),(req,res)=>{
 });
 
 // Public, non-secret client configuration for embeddable chatbot.
-app.get("/api/public/client-config",rateLimit("public-config",120,60000),(req,res)=>{const s=ensureStoreShape(readStore());const id=normaliseClientId(req.query.clientId||s.settings.clientId);const c=s.clients.find(x=>x.id===id);if(!c)return res.status(404).json({error:"Client not found"});const sub=subscriptionInfo(c);if(!sub.active)return res.status(403).json({error:`Client subscription is ${sub.status}.`,subscription:sub});const profile=s.clientProfiles[id]||{};const cs=clientSettings(s,id);res.setHeader("Cache-Control","no-store");res.json({clientId:id,businessName:c.name,website:c.website,reportEmail:c.reportEmail||"",clientWhatsApp:cs.clientWhatsApp||"",whatsappCountryCode:cs.whatsappCountryCode||"91",subscription:sub,assistant:profile.assistant||cs.assistant||defaultStore.settings.assistant,customLeadFields:profile.customLeadFields||cs.customLeadFields||[]});});
+app.get("/api/public/client-config",rateLimit("public-config",120,60000),(req,res)=>{const s=ensureStoreShape(readStore());const id=normaliseClientId(req.query.clientId||s.settings.clientId);const c=s.clients.find(x=>x.id===id);if(!c)return res.status(404).json({error:"Client not found"});const sub=subscriptionInfo(c);if(!sub.active)return res.status(403).json({error:`Client subscription is ${sub.status}.`,subscription:sub});const profile=s.clientProfiles[id]||{};const cs=clientSettings(s,id);res.setHeader("Cache-Control","no-store");res.json({clientId:id,businessName:c.name,website:c.website,clientWhatsApp:cs.clientWhatsApp||"",whatsappCountryCode:cs.whatsappCountryCode||"91",subscription:sub,assistant:profile.assistant||cs.assistant||defaultStore.settings.assistant,customLeadFields:profile.customLeadFields||cs.customLeadFields||[]});});
 
 // ---------- Billing (Razorpay) ----------
 // Pricing lives here in one place so the backend, not the browser, is the
@@ -495,7 +569,7 @@ app.get("/api/state",requireAuth,(req,res)=>{
   const filter=x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId);
   const client=clientSettings(s,clientId);
   if(req.session.user.role!=="admin" && !client.subscription.active)return res.status(403).json({error:`Client subscription is ${client.subscription.status}. Please contact ASSISTQ to renew.`,subscription:client.subscription});
-  const profile=s.clientProfiles[clientId]||{assistant:client.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||[]};const gscClient=s.gsc.byClient[clientId]||s.gsc;const gaClient=s.ga4.byClient[clientId]||s.ga4;const out={settings:client,clientId,clients:(req.session.user.role==="admin"?s.clients:s.clients.filter(c=>c.id===clientId)).map(c=>clientRecordForResponse(c,req.session.user.role==="admin")),leads:s.leads.filter(filter).filter(x=>!x.mergedInto),conversations:Object.fromEntries(Object.entries(s.conversations).filter(([,x])=>filter(x))),keywords:s.keywords.filter(x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId)),utm:s.utm,gsc:gscClient,ga4:gaClient,seo:s.seoAudits[clientId]||null,reportHistory:s.reportHistory.filter(x=>x.clientId===clientId),profile,googleConnected:!!googleConnection(s,clientId)?.tokens,googleEmail:googleConnection(s,clientId)?.email||null,user:req.session.user};
+  const profile=s.clientProfiles[clientId]||{assistant:client.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||[]};const gscClient=s.gsc.byClient[clientId]||s.gsc;const gaClient=s.ga4.byClient[clientId]||s.ga4;const out={settings:client,clientId,clients:(req.session.user.role==="admin"?s.clients:s.clients.filter(c=>c.id===clientId)).map(c=>clientRecordForResponse(c,req.session.user.role==="admin")),leads:s.leads.filter(filter).filter(x=>!x.mergedInto),conversations:Object.fromEntries(Object.entries(s.conversations).filter(([,x])=>filter(x))),keywords:s.keywords.filter(x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId)),utm:Object.fromEntries(Object.entries(s.utm||{}).filter(([k])=>String(k).startsWith(clientId+"|"))),gsc:gscClient,ga4:gaClient,seo:s.seoAudits[clientId]||null,reportHistory:s.reportHistory.filter(x=>x.clientId===clientId),profile,googleConnected:!!googleConnection(s,clientId)?.tokens,googleEmail:googleConnection(s,clientId)?.email||null,user:req.session.user};
   writeStore(s);res.json(out);
 });
 
@@ -1076,7 +1150,7 @@ app.get("/api/deployment/check",requireAdmin,(req,res)=>{const checks=[
 ];res.json({ready:checks.every(x=>x.ok),checks});});
 
 // ---------- Reports ----------
-async function sendWeeklyReport(clientId){const s=ensureStoreShape(readStore());const cs=clientSettings(s,clientId);if(!cs.reportEmail)return {ok:false,reason:"Report email is not configured for this client."};const leads=s.leads.filter(x=>x.clientId===clientId);const conv=Object.values(s.conversations).filter(x=>x.clientId===clientId);const hot=leads.filter(x=>x.status==="HOT").length,warm=leads.filter(x=>x.status==="WARM").length,cold=leads.filter(x=>x.status==="COLD").length;const seo=s.seoAudits[clientId];const top=leads.filter(x=>x.status==="HOT").slice(0,10).map(x=>{const wa=whatsappUrl(x.phone,`Hi ${x.name}, this is ${cs.businessName}. Following up on your enquiry.`);return `<li><b>${escapeHtml(x.name)}</b> — ${x.score}/100 — ${escapeHtml(x.budget||"Budget not provided")} ${wa?`<a href="${wa}">WhatsApp</a>`:""}</li>`}).join("")||"<li>No hot leads.</li>";const html=`<h2>ASSISTQ Weekly Growth Report</h2><p><b>${escapeHtml(cs.businessName)}</b></p><p>Leads: <b>${leads.length}</b> · Hot: <b>${hot}</b> · Warm: <b>${warm}</b> · Cold: <b>${cold}</b></p><p>Conversations: ${conv.length}</p><p>UTM-attributed campaigns: ${Object.keys(s.utm).filter(k=>k.startsWith(clientId+"|")).length}</p><p>SEO health: ${seo?seo.score+"/100":"Not audited"}</p><h3>Priority leads</h3><ul>${top}</ul>`;const g=googleConnection(s,clientId); if(g?.tokens){const client=oauthClient();client.setCredentials(g.tokens);const raw=Buffer.from([`To: ${cs.reportEmail}`,`Subject: ASSISTQ Weekly Growth Report — ${cs.businessName}`,"Content-Type: text/html; charset=utf-8","",html].join("\r\n")).toString("base64url");await google.gmail({version:"v1",auth:client}).users.messages.send({userId:"me",requestBody:{raw}});}else{if(!process.env.SMTP_HOST||!process.env.SMTP_USER||!process.env.SMTP_PASS)return {ok:false,reason:"Connect the client Google account or configure SMTP before sending reports."};const transporter=nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:Number(process.env.SMTP_PORT||587)===465,auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}});await transporter.sendMail({from:process.env.REPORT_FROM||process.env.SMTP_USER,to:cs.reportEmail,subject:`ASSISTQ Weekly Growth Report — ${cs.businessName}`,html});}s.reportHistory.unshift({clientId,sentAt:new Date().toISOString(),to:cs.reportEmail});writeStore(s);return {ok:true};}
+async function sendWeeklyReport(clientId){const s=ensureStoreShape(readStore());const cs=clientSettings(s,clientId);if(!cs.reportEmail)return {ok:false,reason:"Report email is not configured for this client."};const leads=s.leads.filter(x=>x.clientId===clientId);const conv=Object.values(s.conversations).filter(x=>x.clientId===clientId);const hot=leads.filter(x=>x.status==="HOT").length,warm=leads.filter(x=>x.status==="WARM").length,cold=leads.filter(x=>x.status==="COLD").length;const seo=s.seoAudits[clientId];const top=leads.filter(x=>x.status==="HOT").slice(0,10).map(x=>{const wa=whatsappUrl(x.phone,`Hi ${x.name}, this is ${cs.businessName}. Following up on your enquiry.`,clientId);return `<li><b>${escapeHtml(x.name)}</b> — ${x.score}/100 — ${escapeHtml(x.budget||"Budget not provided")} ${wa?`<a href="${wa}">WhatsApp</a>`:""}</li>`}).join("")||"<li>No hot leads.</li>";const html=`<h2>ASSISTQ Weekly Growth Report</h2><p><b>${escapeHtml(cs.businessName)}</b></p><p>Leads: <b>${leads.length}</b> · Hot: <b>${hot}</b> · Warm: <b>${warm}</b> · Cold: <b>${cold}</b></p><p>Conversations: ${conv.length}</p><p>UTM-attributed campaigns: ${Object.keys(s.utm).filter(k=>k.startsWith(clientId+"|")).length}</p><p>SEO health: ${seo?seo.score+"/100":"Not audited"}</p><h3>Priority leads</h3><ul>${top}</ul>`;const g=googleConnection(s,clientId); if(g?.tokens){const client=oauthClient();client.setCredentials(g.tokens);const raw=Buffer.from([`To: ${cs.reportEmail}`,`Subject: ASSISTQ Weekly Growth Report — ${cs.businessName}`,"Content-Type: text/html; charset=utf-8","",html].join("\r\n")).toString("base64url");await google.gmail({version:"v1",auth:client}).users.messages.send({userId:"me",requestBody:{raw}});}else{if(!process.env.SMTP_HOST||!process.env.SMTP_USER||!process.env.SMTP_PASS)return {ok:false,reason:"Connect the client Google account or configure SMTP before sending reports."};const transporter=nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:Number(process.env.SMTP_PORT||587)===465,auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}});await transporter.sendMail({from:process.env.REPORT_FROM||process.env.SMTP_USER,to:cs.reportEmail,subject:`ASSISTQ Weekly Growth Report — ${cs.businessName}`,html});}s.reportHistory.unshift({clientId,sentAt:new Date().toISOString(),to:cs.reportEmail});writeStore(s);return {ok:true};}
 function escapeHtml(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));}
 app.post("/api/reports/send",requireAuth,async(req,res)=>{try{const s=readStore();const id=selectedClient(req,s);res.json(await sendWeeklyReport(id));}catch(e){res.status(500).json({error:e.message});}});
 
@@ -1140,7 +1214,13 @@ app.use((req,res,next)=>{if(req.method!=="GET")return next();if(req.path.startsW
 setInterval(processRealEstateAutomation,60000);
 try {
   await initDB(defaultStore);
+  configureSessions();
   const server = app.listen(PORT,()=>console.log(`ASSISTQ Growth Platform running on port ${PORT}`));
+  setInterval(() => {
+    getDBPool().query("DELETE FROM assistq_sessions WHERE expire <= now()").catch(e =>
+      console.error("ASSISTQ: session cleanup failed:", e.message)
+    );
+  }, 60 * 60 * 1000);
 
   // Without this, a redeploy could silently lose data: every write updates
   // the in-memory copy immediately (so the same request's response reflects
