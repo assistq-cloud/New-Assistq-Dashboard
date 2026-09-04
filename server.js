@@ -3,6 +3,7 @@ import session from "express-session";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import nodemailer from "nodemailer";
@@ -17,7 +18,7 @@ const PORT=Number(process.env.PORT||8787);
 
 const defaultStore={
   settings:{businessName:"Demo Realty Group",clientId:"demo-realty",website:"https://example-realty.in",reportEmail:"",clientWhatsApp:"",whatsappCountryCode:"91",reportEnabled:false,hotThreshold:80,warmThreshold:50,assistant:{name:"ASSISTQ Assistant",greeting:"Hi! 👋 What can I help you with today?",tone:"Professional, friendly and concise",knowledge:"",questions:[]},customLeadFields:[],scoring:{name:10,phone:15,email:5,location:{default:6,matchPoints:10,serviceAreas:["Navi Mumbai","Mumbai","Thane","Pune"]},engagement:5,purpose:{default:5,values:{"Buying":10,"Renting":6}},configuration:{default:9,values:{"1BHK":9,"2BHK":12,"3BHK":14,"4BHK":15}},budget:{default:9,values:{"Under ₹50L":9,"₹50L-1Cr":11,"₹1Cr-2Cr":13,"₹2Cr+":15}},timeline:{default:8,values:{"Immediately":15,"1-3 months":11,"3-6 months":8,"Just exploring":4}}}},
-  clients:[{id:"demo-realty",name:"Demo Realty Group",website:"https://example-realty.in",reportEmail:"",accessCode:"ASSISTQ-DEMO",plan:"Demo",subscriptionStatus:"active",subscriptionStart:null,subscriptionEnd:null}],
+  clients:[{id:"demo-realty",name:"Demo Realty Group",website:"https://example-realty.in",reportEmail:"",accessCode:"ASSISTQ-DEMO",plan:"Demo",subscriptionStatus:"active",subscriptionStart:null,subscriptionEnd:null,landingPageFile:null}],
   keywords:[
     {id:"kw1",clientId:"demo-realty",keyword:"2 bhk flats in kharghar",targetUrl:"/2-bhk-kharghar",priority:"High",intent:"Commercial"},
     {id:"kw2",clientId:"demo-realty",keyword:"flats for sale in kharghar",targetUrl:"/flats-sale-kharghar",priority:"High",intent:"Commercial"},
@@ -54,7 +55,7 @@ function ensureStoreShape(s){
   s.realEstate.automationByClient=s.realEstate.automationByClient||{};
   s.realEstate.roundRobin=s.realEstate.roundRobin||{};
  s.clients=s.clients||defaultStore.clients; s.clientProfiles=s.clientProfiles||{}; s.keywords=s.keywords||[]; s.leads=s.leads||[]; s.conversations=s.conversations||{}; s.utm=s.utm||{}; s.gsc=s.gsc||defaultStore.gsc; s.gsc.byClient=s.gsc.byClient||{}; s.ga4=s.ga4||defaultStore.ga4; s.ga4.byClient=s.ga4.byClient||{}; s.google=s.google||defaultStore.google; s.google.byClient=s.google.byClient||{}; s.seoAudits=s.seoAudits||{}; s.reportHistory=s.reportHistory||[]; s.security=s.security||{adminPasswordHash:null}; s.whatsappThreads=s.whatsappThreads||{};
-  s.clients=s.clients.map(c=>({...c,accessCode:c.accessCode||crypto.randomBytes(4).toString("hex").toUpperCase(),plan:c.plan||"Starter",subscriptionStatus:c.subscriptionStatus||"active",subscriptionStart:c.subscriptionStart||null,subscriptionEnd:c.subscriptionEnd||null}));
+  s.clients=s.clients.map(c=>({...c,accessCode:c.accessCode||crypto.randomBytes(4).toString("hex").toUpperCase(),plan:c.plan||"Starter",subscriptionStatus:c.subscriptionStatus||"active",subscriptionStart:c.subscriptionStart||null,subscriptionEnd:c.subscriptionEnd||null,landingPageFile:normaliseLandingPageFile(c.landingPageFile)||null}));
   s.leads=s.leads.map(l=>({...l,pipelineStage:l.pipelineStage||"NEW",assignedTo:l.assignedTo||null,notes:l.notes||"",responseMinutes:l.responseMinutes??null,updatedAt:l.updatedAt||l.date||new Date().toISOString()}));
   return s;
 }
@@ -124,7 +125,32 @@ app.use((req,res,next)=>{
 app.use(express.static(path.join(__dirname,"public")));
 
 function normaliseClientId(id){return String(id||"demo-realty").toLowerCase().replace(/[^a-z0-9_-]/g,"-").slice(0,60)||"demo-realty";}
-function clientSettings(s,id){const c=s.clients.find(x=>x.id===id)||{};return {...s.settings,...c,clientId:id,subscription:subscriptionInfo(c),assistant:c.assistant||s.settings.assistant,customLeadFields:c.customLeadFields||s.settings.customLeadFields,scoring:c.scoring||s.settings.scoring,hotThreshold:c.hotThreshold??s.settings.hotThreshold,warmThreshold:c.warmThreshold??s.settings.warmThreshold,reportEnabled:c.reportEnabled??s.settings.reportEnabled,clientWhatsApp:c.clientWhatsApp||s.settings.clientWhatsApp||"",whatsappCountryCode:c.whatsappCountryCode||s.settings.whatsappCountryCode};}
+function normaliseLandingPageFile(file){
+  const value=String(file||"").trim().replace(/\\/g,"/");
+  if(!value||value.includes("..")||value.startsWith("/")||!/^[-a-zA-Z0-9_./]+\.html$/i.test(value))return "";
+  const base=path.basename(value);
+  if(base.toLowerCase()!==value.toLowerCase())return "";
+  const reserved=new Set(["index.html","chatbot.html","widget.html"]);
+  if(reserved.has(base.toLowerCase()))return "";
+  const publicDir=path.join(__dirname,"public");
+  const target=path.resolve(publicDir,base);
+  if(!target.toLowerCase().startsWith(publicDir.toLowerCase()+path.sep)||!fs.existsSync(target)||!fs.statSync(target).isFile())return "";
+  return base;
+}
+function availableLandingPages(){
+  const publicDir=path.join(__dirname,"public");
+  try{
+    return fs.readdirSync(publicDir,{withFileTypes:true})
+      .filter(e=>e.isFile()&&/\.html$/i.test(e.name)&&!new Set(["index.html","chatbot.html","widget.html"]).has(e.name.toLowerCase()))
+      .map(e=>e.name)
+      .sort((a,b)=>a.localeCompare(b));
+  }catch{return [];}
+}
+function landingPageUrl(req,clientId,file){
+  const base=process.env.APP_BASE_URL||`${req.protocol}://${req.get("host")}`;
+  return `${String(base).replace(/\/$/,"")}/landing/${encodeURIComponent(clientId)}`;
+}
+function clientSettings(s,id){const c=s.clients.find(x=>x.id===id)||{};return {...s.settings,...c,clientId:id,subscription:subscriptionInfo(c),assistant:c.assistant||s.settings.assistant,customLeadFields:c.customLeadFields||s.settings.customLeadFields,scoring:c.scoring||s.settings.scoring,hotThreshold:c.hotThreshold??s.settings.hotThreshold,warmThreshold:c.warmThreshold??s.settings.warmThreshold,reportEnabled:c.reportEnabled??s.settings.reportEnabled,clientWhatsApp:c.clientWhatsApp||s.settings.clientWhatsApp||"",whatsappCountryCode:c.whatsappCountryCode||s.settings.whatsappCountryCode,landingPageFile:c.landingPageFile||null};}
 function requireAuth(req,res,next){if(!req.session.user)return res.status(401).json({error:"Authentication required"});next();}
 function requireAdmin(req,res,next){if(!req.session.user||req.session.user.role!=="admin")return res.status(403).json({error:"Admin access required"});next();}
 function selectedClient(req,s){return normaliseClientId(req.query.clientId||req.body?.clientId||req.session.user?.clientId||s.settings.clientId);}
@@ -260,6 +286,35 @@ app.post("/api/auth/change-password",requireAuth,rateLimit("change-password",5,6
   s.security.adminPasswordHash=hashPassword(next);
   writeStore(s);
   res.json({ok:true});
+});
+
+// Admin-only list of HTML landing pages available in the deployed public/ folder.
+app.get("/api/admin/landing-pages",requireAdmin,(req,res)=>{
+  res.json({files:availableLandingPages()});
+});
+
+// Public client landing-page route. The selected HTML file is served server-side
+// and ASSISTQ's floating chatbot is injected automatically, so the client gets
+// one shareable URL without editing the HTML file itself.
+app.get("/landing/:clientId",rateLimit("public-landing",120,60000),(req,res)=>{
+  const s=ensureStoreShape(readStore());
+  const id=normaliseClientId(req.params.clientId);
+  const c=s.clients.find(x=>x.id===id);
+  if(!c)return res.status(404).send("Client not found");
+  const sub=subscriptionInfo(c);
+  if(!sub.active)return res.status(403).send("This client landing page is temporarily unavailable.");
+  const file=normaliseLandingPageFile(c.landingPageFile);
+  if(!file)return res.status(404).send("No personalized landing page has been assigned to this client.");
+  const full=path.join(__dirname,"public",file);
+  let html;
+  try{html=fs.readFileSync(full,"utf8");}catch{return res.status(404).send("Landing page file not found in the deployed public folder.");}
+  const dashboardUrl=String(process.env.APP_BASE_URL||`${req.protocol}://${req.get("host")}`).replace(/\/$/,"");
+  const embed=`<script src="${dashboardUrl}/embed.js" data-client="${id}" data-dashboard="${dashboardUrl}"></script>`;
+  if(/<\/body>/i.test(html)) html=html.replace(/<\/body>/i,`${embed}\n</body>`);
+  else html+=`\n${embed}`;
+  res.setHeader("Content-Type","text/html; charset=utf-8");
+  res.setHeader("Cache-Control","no-store");
+  res.send(html);
 });
 
 // Public, non-secret client configuration for embeddable chatbot.
@@ -438,7 +493,33 @@ app.post("/api/settings",requireAuth,(req,res)=>{
 app.get("/api/client/profile",requireAuth,(req,res)=>{const s=ensureStoreShape(readStore());const id=selectedClient(req,s);if(req.session.user.role!=="admin"&&req.session.user.clientId!==id)return res.status(403).json({error:"Workspace access denied"});const cs=clientSettings(s,id);res.json(s.clientProfiles[id]||{assistant:cs.assistant||defaultStore.settings.assistant,customLeadFields:cs.customLeadFields||[]});});
 app.post("/api/client/profile",requireAuth,(req,res)=>{if(req.session.user?.role==="staff")return res.status(403).json({error:"Only the business owner or an admin can change these settings."});const s=ensureStoreShape(readStore());const id=selectedClient(req,s);if(req.session.user.role!=="admin"&&req.session.user.clientId!==id)return res.status(403).json({error:"Workspace access denied"});const assistant={name:String(req.body.assistant?.name||"ASSISTQ Assistant").slice(0,80),greeting:String(req.body.assistant?.greeting||"Hi! 👋 What can I help you with today?").slice(0,300),tone:String(req.body.assistant?.tone||"Professional, friendly and concise").slice(0,300),knowledge:String(req.body.assistant?.knowledge||"").slice(0,12000),questions:Array.isArray(req.body.assistant?.questions)?req.body.assistant.questions.slice(0,20):[]};const customLeadFields=Array.isArray(req.body.customLeadFields)?req.body.customLeadFields.slice(0,30).map(x=>({key:String(x.key||"").trim().toLowerCase().replace(/[^a-z0-9_]/g,"_").slice(0,40),label:String(x.label||"").trim().slice(0,80),required:!!x.required})).filter(x=>x.key&&x.label):[];s.clientProfiles[id]={assistant,customLeadFields};const idx=s.clients.findIndex(x=>x.id===id);if(idx>=0)s.clients[idx]={...s.clients[idx],assistant,customLeadFields};if(id===s.settings.clientId)s.settings={...s.settings,assistant,customLeadFields};writeStore(s);res.json({ok:true,profile:s.clientProfiles[id]});});
 
-app.post("/api/clients",requireAdmin,(req,res)=>{const s=ensureStoreShape(readStore());if(!req.body.name)return res.status(400).json({error:"Client name required"});const id=normaliseClientId(req.body.id||req.body.name);if(s.clients.some(x=>x.id===id))return res.status(409).json({error:"Client already exists"});const c={id,name:String(req.body.name),website:String(req.body.website||""),reportEmail:String(req.body.reportEmail||""),clientWhatsApp:String(req.body.clientWhatsApp||""),accessCode:crypto.randomBytes(5).toString("hex").toUpperCase(),plan:String(req.body.plan||"Starter"),subscriptionStatus:"active",subscriptionStart:req.body.subscriptionStart||new Date().toISOString(),subscriptionEnd:req.body.subscriptionEnd||null};s.clients.push(c);s.settings={...s.settings,clientId:id,businessName:c.name,website:c.website,reportEmail:c.reportEmail};writeStore(s);res.status(201).json(c);});
+app.post("/api/clients",requireAdmin,(req,res)=>{
+  const s=ensureStoreShape(readStore());
+  if(!req.body.name)return res.status(400).json({error:"Client name required"});
+  const id=normaliseClientId(req.body.id||req.body.name);
+  if(s.clients.some(x=>x.id===id))return res.status(409).json({error:"Client already exists"});
+  const requestedLanding=req.body.landingPageFile?String(req.body.landingPageFile):"";
+  const landingPageFile=requestedLanding?normaliseLandingPageFile(requestedLanding):null;
+  if(requestedLanding&&!landingPageFile)return res.status(400).json({error:"Invalid landing page. Choose an HTML file from the available public/ landing pages."});
+  const c={id,name:String(req.body.name),website:String(req.body.website||""),reportEmail:String(req.body.reportEmail||""),clientWhatsApp:String(req.body.clientWhatsApp||""),accessCode:crypto.randomBytes(5).toString("hex").toUpperCase(),plan:String(req.body.plan||"Starter"),subscriptionStatus:"active",subscriptionStart:req.body.subscriptionStart||new Date().toISOString(),subscriptionEnd:req.body.subscriptionEnd||null,landingPageFile};
+  s.clients.push(c);
+  s.settings={...s.settings,clientId:id,businessName:c.name,website:c.website,reportEmail:c.reportEmail};
+  writeStore(s);
+  res.status(201).json({...c,landingPageUrl:landingPageFile?landingPageUrl(req,id,landingPageFile):null});
+});
+
+app.post("/api/clients/:id/landing-page",requireAdmin,(req,res)=>{
+  const s=ensureStoreShape(readStore());
+  const id=normaliseClientId(req.params.id);
+  const idx=s.clients.findIndex(x=>x.id===id);
+  if(idx<0)return res.status(404).json({error:"Client not found"});
+  const requested=String(req.body.landingPageFile||"").trim();
+  const file=requested?normaliseLandingPageFile(requested):null;
+  if(requested&&!file)return res.status(400).json({error:"Invalid landing page. Choose an HTML file from the available public/ landing pages."});
+  s.clients[idx]={...s.clients[idx],landingPageFile:file};
+  writeStore(s);
+  res.json({ok:true,client:s.clients[idx],landingPageUrl:file?landingPageUrl(req,id,file):null});
+});
 
 // ---------- Subscription management ----------
 app.post("/api/clients/:id/subscription",requireAdmin,(req,res)=>{
