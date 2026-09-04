@@ -15,8 +15,8 @@
 const TEST_MODE = false;
 
 const CONFIG = {
-  dashboardUrl: "https://assistq.in", // Fallback only; Script Properties should override this in production.
-  clientEmail: "assistq1@gmail.com",
+  dashboardUrl: "https://app.assistq.in", // Fallback only; Script Properties should override this in production.
+  clientEmail: "assistiq1@gmail.com",
   clientWhatsApp: "918446242738",
   businessName: "ASSISTQ",
   sheetName: "Leads",
@@ -95,32 +95,53 @@ A: Yes. I can collect your details and the team can arrange a suitable time.
 };
 // =========================================================
 
-function normaliseClientId_(id){return String(id||"demo-realty").toLowerCase().replace(/[^a-z0-9_-]/g,"-").slice(0,60)||"demo-realty";}
+// PER-CLIENT DEPLOYMENT: each client's Apps Script deployment should have
+// its own script properties: ASSISTQ_CLIENT_ID, ASSISTQ_BUSINESS_NAME,
+// ASSISTQ_CLIENT_EMAIL, ASSISTQ_CLIENT_WHATSAPP, ASSISTQ_SPREADSHEET_ID
+// (optional when the script is bound to the client's Sheet),
+// ASSISTQ_SHEET_NAME, and ASSISTQ_WEBHOOK_SECRET.
+// AssistQ's server also forwards the client values on each request.
+// The per-client webhook URL is stored in the AssistQ client record and is
+// selected server-side, so one client's webhook can never be used for another.
+function normaliseClientId_(id){return String(id||"").toLowerCase().replace(/[^a-z0-9_-]/g,"-").slice(0,60)||"client";}
 
-function dashboardUrl_(data){
-  const prop=PropertiesService.getScriptProperties().getProperty("ASSISTQ_DASHBOARD_URL") || CONFIG.dashboardUrl || "";
-  return String(prop).trim().replace(/\/$/,"");
+function prop_(key, fallback){
+  const v=PropertiesService.getScriptProperties().getProperty(key);
+  return v===null||v===undefined||String(v).trim()==="" ? fallback : String(v).trim();
+}
+
+function runtimeConfig_(data){
+  data=data||{};
+  const clientId=normaliseClientId_(data.clientId);
+  const businessName=String(data.businessName||prop_("ASSISTQ_BUSINESS_NAME",CONFIG.businessName)||"").trim();
+  const clientEmail=String(data.reportEmail||prop_("ASSISTQ_CLIENT_EMAIL",CONFIG.clientEmail)||"").trim();
+  const clientWhatsApp=String(data.clientWhatsApp||prop_("ASSISTQ_CLIENT_WHATSAPP",CONFIG.clientWhatsApp)||"").trim();
+  const sheetName=String(prop_("ASSISTQ_SHEET_NAME",CONFIG.sheetName)||"Leads").trim();
+  const spreadsheetId=String(prop_("ASSISTQ_SPREADSHEET_ID",data.googleSpreadsheetId||"")||"").trim();
+  const secret=String(prop_("ASSISTQ_WEBHOOK_SECRET","")||"").trim();
+  return {clientId,businessName,clientEmail,clientWhatsApp,sheetName,spreadsheetId,secret};
+}
+
+function assertWebhookSecret_(data){
+  const expected=prop_("ASSISTQ_WEBHOOK_SECRET","");
+  if(expected && String(data.webhookSecret||"")!==expected) throw new Error("Invalid AssistQ webhook secret for this client.");
+}
+
+function spreadsheet_(cfg){
+  if(cfg.spreadsheetId) return SpreadsheetApp.openById(cfg.spreadsheetId);
+  return SpreadsheetApp.getActiveSpreadsheet();
 }
 
 function getClientConfig_(data){
-  const clientId=normaliseClientId_(data&&data.clientId);
-  const dashboard=dashboardUrl_(data);
-  if(!dashboard) throw new Error("ASSISTQ_DASHBOARD_URL is not configured in Script Properties.");
-  const url=dashboard+"/api/public/client-config?clientId="+encodeURIComponent(clientId);
-  const response=UrlFetchApp.fetch(url,{method:"get",muteHttpExceptions:true,headers:{"Accept":"application/json"}});
-  const code=response.getResponseCode();
-  if(code<200 || code>=300) throw new Error("ASSISTQ client verification failed (HTTP "+code+").");
-  const cfg=JSON.parse(response.getContentText());
-  if(!cfg || cfg.clientId!==clientId) throw new Error("ASSISTQ client verification returned an invalid client.");
-  const sub=cfg.subscription||{};
-  return {clientId,active:sub.active!==false,verified:true,businessName:cfg.businessName||CONFIG.businessName,clientEmail:cfg.reportEmail||CONFIG.clientEmail,clientWhatsApp:cfg.clientWhatsApp||CONFIG.clientWhatsApp,assistant:cfg.assistant||null};
+  // Client configuration is now supplied by AssistQ's server. This Apps Script
+  // must never call back into app.assistq.in, which avoids Google UrlFetch
+  // network/redirect issues and removes the old cross-client configuration leak.
+  const cfg=runtimeConfig_(data);
+  assertWebhookSecret_(data);
+  return {clientId:cfg.clientId,active:true,verified:true,businessName:cfg.businessName,clientEmail:cfg.clientEmail,clientWhatsApp:cfg.clientWhatsApp,assistant:data.assistant||null,sheetName:cfg.sheetName,spreadsheetId:cfg.spreadsheetId};
 }
 
-function assertClientActive_(data){
-  const cfg=getClientConfig_(data);
-  if(!cfg.active) throw new Error("ASSISTQ subscription is not active for this client.");
-  return cfg;
-}
+function assertClientActive_(data){ return getClientConfig_(data); }
 
 function effectiveConfig_(data){
   const remote=assertClientActive_(data);
@@ -128,7 +149,7 @@ function effectiveConfig_(data){
   const questions=(Array.isArray(assistant.questions)&&assistant.questions.length)
     ? assistant.questions.map(function(q){return {key:String(q.key||q.id||"").trim(),label:String(q.label||q.question||q.key||"").trim()};}).filter(function(q){return q.key&&q.label;})
     : CONFIG.questions;
-  return {businessName:remote.businessName||CONFIG.businessName,questions:questions,faq:String(assistant.knowledge||CONFIG.faq||""),clientEmail:remote.clientEmail||CONFIG.clientEmail,clientWhatsApp:remote.clientWhatsApp||CONFIG.clientWhatsApp};
+  return {businessName:remote.businessName||CONFIG.businessName,questions:questions,faq:String(assistant.knowledge||CONFIG.faq||""),clientEmail:remote.clientEmail||CONFIG.clientEmail,clientWhatsApp:remote.clientWhatsApp||CONFIG.clientWhatsApp,sheetName:remote.sheetName,spreadsheetId:remote.spreadsheetId};
 }
 
 function doPost(e) {
@@ -136,6 +157,7 @@ function doPost(e) {
   let data = {};
   try {
     data = JSON.parse(e.postData.contents);
+    assertWebhookSecret_(data);
 
     if (data.action === "chat") {
       const clientCfg = effectiveConfig_(data);
@@ -145,8 +167,8 @@ function doPost(e) {
 
     if (data.action === "submit") {
       const clientCfg = assertClientActive_(data);
-      const scored = scoreLead(data.fields || {});
-      logToSheet(timestamp, data.fields || {}, data.utm || {}, scored, data.clientId || clientCfg.clientId);
+      const scored = scoreLead(data.fields || {}, data.scoring || null);
+      logToSheet(timestamp, data.fields || {}, data.utm || {}, scored, data.clientId || clientCfg.clientId, clientCfg);
       emailClient(data.fields || {}, scored, clientCfg.businessName, clientCfg.clientEmail, clientCfg.clientWhatsApp);
       return jsonOut({ status: "success", clientId: clientCfg.clientId });
     }
@@ -155,13 +177,14 @@ function doPost(e) {
 
   } catch (err) {
     try {
-      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const ss = spreadsheet_(runtimeConfig_(data));
       let dbg = ss.getSheetByName("Errors");
       if (!dbg) dbg = ss.insertSheet("Errors");
       dbg.appendRow([timestamp, err.toString()]);
-      MailApp.sendEmail(
-        "assistq1@gmail.com",
-        `⚠️ Bot error — ${data.businessName || CONFIG.businessName}`,
+      const errorEmail=String(data.reportEmail||prop_("ASSISTQ_ERROR_EMAIL",prop_("ASSISTQ_CLIENT_EMAIL",""))||"").trim();
+      if(errorEmail) MailApp.sendEmail(
+        errorEmail,
+        `⚠️ Bot error — ${data.businessName || prop_("ASSISTQ_BUSINESS_NAME",CONFIG.businessName)}`,
         `An error occurred:\n\n${err.toString()}\n\nSheet: ${ss.getUrl()}\nTime: ${timestamp}`
       );
     } catch (e2) { /* ignore */ }
@@ -175,10 +198,32 @@ function jsonOut(obj) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+function stripJsonEnvelope_(text) {
+  const t = String(text || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  try {
+    const obj = JSON.parse(t);
+    if (obj && typeof obj === "object") return String(obj.reply || obj.message || obj.text || "Got it, thanks!");
+  } catch (_) {}
+  return t;
+}
+
+function parseAssistantJson_(text) {
+  const clean = String(text || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  try { return JSON.parse(clean); } catch (_) {}
+
+  // Recover the first complete JSON object if the model added a short prefix/suffix.
+  const start = clean.indexOf("{");
+  const end = clean.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try { return JSON.parse(clean.slice(start, end + 1)); } catch (_) {}
+  }
+  throw new Error("Could not parse assistant JSON");
+}
+
 function handleChat(data, clientCfg) {
   const knownFields = data.knownFields || {};
 
-  if (!TEST_MODE && data.leadId) trackSession(data.leadId);
+  if (!TEST_MODE && data.leadId) trackSession(data.leadId, clientCfg);
 
   if (TEST_MODE) {
     const nextQ = clientCfg.questions.find(q => !knownFields[q.key]);
@@ -252,15 +297,37 @@ Example of a correct response:
   let parsed;
   let extractionFailed = false;
   try {
-    const textBlock = result.content.find(b => b.type === "text");
+    const textBlock = (result.content || []).find(b => b.type === "text");
     if (!textBlock) throw new Error("No text block in response");
-    const cleanText = textBlock.text.replace(/```json|```/g, "").trim();
-    parsed = JSON.parse(cleanText);
+    parsed = parseAssistantJson_(textBlock.text);
+    if (!parsed || typeof parsed !== "object") throw new Error("Assistant JSON was not an object");
   } catch (e) {
     extractionFailed = true;
-    const textBlock = result.content.find(b => b.type === "text");
-    parsed = { reply: textBlock ? textBlock.text.trim() : "Got it, thanks!", fields: {} };
+    const textBlock = (result.content || []).find(b => b.type === "text");
+    const fallbackText = textBlock ? stripJsonEnvelope_(textBlock.text) : "Got it, thanks!";
+    parsed = { reply: fallbackText, fields: {} };
   }
+
+  // Some Claude responses may wrap the structured payload one level deeper
+  // (for example { reply: "...", json: { reply: "...", fields: {...} } }).
+  // Normalise that shape here so the widget NEVER displays the raw JSON
+  // envelope to the visitor.
+  if (parsed && parsed.json && typeof parsed.json === "object") {
+    parsed = Object.assign({}, parsed.json, parsed);
+    if (parsed.json && typeof parsed.json === "object") {
+      parsed.fields = parsed.json.fields || parsed.fields || {};
+      parsed.reply = parsed.json.reply || parsed.reply;
+    }
+    delete parsed.json;
+  }
+  if (parsed && typeof parsed.reply === "object") {
+    const nested = parsed.reply;
+    parsed.reply = nested.reply || nested.message || nested.text || JSON.stringify(nested);
+    if (nested.fields && typeof nested.fields === "object") {
+      parsed.fields = Object.assign({}, parsed.fields || {}, nested.fields);
+    }
+  }
+  if (typeof parsed.reply !== "string") parsed.reply = String(parsed.reply || "Got it, thanks!");
 
   // Trust the AI's own structured field extraction — that's exactly what
   // the JSON contract above asks it to produce, and it understands the
@@ -300,8 +367,8 @@ function isLikelyQuestion(text) {
  * Logs each unique conversation once (by leadId), so the weekly report can
  * show real "conversations started" numbers, not just completed leads.
  */
-function trackSession(leadId) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+function trackSession(leadId, passedCfg) {
+  const ss = spreadsheet_(passedCfg || runtimeConfig_({clientId:leadId}));
   let sheet = ss.getSheetByName("Sessions");
   if (!sheet) {
     sheet = ss.insertSheet("Sessions");
@@ -320,8 +387,8 @@ function trackSession(leadId) {
  * Timeline 20/20 + Location 17/20 + Intent 8/10 = 90/100.
  * Returns { score, band } — band is Hot/Warm/Cold based on CONFIG.scoringRules.bands.
  */
-function scoreLead(fields) {
-  const rules = CONFIG.scoringRules;
+function scoreLead(fields, customRules) {
+  const rules = customRules && Array.isArray(customRules.fields) ? customRules : CONFIG.scoringRules;
   if (!rules) return { score: null, band: "" };
 
   let total = 0;
@@ -349,15 +416,16 @@ function scoreLead(fields) {
   return { score: total, band: band };
 }
 
-function logToSheet(timestamp, data, utm, scored, clientId) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName(CONFIG.sheetName);
+function logToSheet(timestamp, data, utm, scored, clientId, passedCfg) {
+  const cfg = passedCfg || runtimeConfig_({clientId});
+  const ss = spreadsheet_(cfg);
+  let sheet = ss.getSheetByName(cfg.sheetName);
   const fieldKeys = Object.keys(data);
   const utmCols = ["UTM Source", "UTM Medium", "UTM Campaign"];
   const fixedCols = ["Timestamp", "Client ID", "Score", "Band", ...utmCols];
 
   if (!sheet || sheet.getLastColumn() === 0) {
-    if (!sheet) sheet = ss.insertSheet(CONFIG.sheetName);
+    if (!sheet) sheet = ss.insertSheet(cfg.sheetName);
     sheet.appendRow([...fixedCols, ...fieldKeys.map(toLabel)]);
   } else {
     const existingHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -408,7 +476,7 @@ ${lines}
 
 Tap to notify yourself on WhatsApp: ${waLink}`;
 
-  MailApp.sendEmail(clientEmail || CONFIG.clientEmail, subject, body);
+  MailApp.sendEmail(clientEmail, subject, body);
 }
 
 /**
@@ -430,8 +498,9 @@ function createWeeklyTrigger() {
 }
 
 function sendWeeklyReport() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(CONFIG.sheetName);
+  const cfg=runtimeConfig_({clientId:prop_("ASSISTQ_CLIENT_ID","client")});
+  const ss = spreadsheet_(cfg);
+  const sheet = ss.getSheetByName(cfg.sheetName);
   if (!sheet || sheet.getLastRow() < 2) return;
 
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -482,7 +551,7 @@ function sendWeeklyReport() {
 
   const insight = generateWeeklyInsight(bySource, totalLeads, totalQualified, totalHot);
 
-  const body = `📊 ${CONFIG.businessName} Weekly Lead Intelligence
+  const body = `📊 ${cfg.businessName} Weekly Lead Intelligence
 
 PERFORMANCE
 ${conversationsCount} conversations started
@@ -499,7 +568,7 @@ ${tableRows || "  (none)"}
 ${insight ? `AI INSIGHT\n${insight}\n` : ""}
 Full details in your Sheet: ${ss.getUrl()}`;
 
-  MailApp.sendEmail(CONFIG.clientEmail, `📊 Weekly Lead Intelligence — ${CONFIG.businessName}`, body);
+  MailApp.sendEmail(cfg.clientEmail, `📊 Weekly Lead Intelligence — ${cfg.businessName}`, body);
 }
 
 /**
