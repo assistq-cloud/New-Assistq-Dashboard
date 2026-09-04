@@ -55,9 +55,14 @@ function ensureStoreShape(s){
   s.realEstate.automationByClient=s.realEstate.automationByClient||{};
   s.realEstate.roundRobin=s.realEstate.roundRobin||{};
  s.clients=s.clients||defaultStore.clients; s.clientProfiles=s.clientProfiles||{}; s.keywords=s.keywords||[]; s.leads=s.leads||[]; s.conversations=s.conversations||{}; s.utm=s.utm||{}; s.gsc=s.gsc||defaultStore.gsc; s.gsc.byClient=s.gsc.byClient||{}; s.ga4=s.ga4||defaultStore.ga4; s.ga4.byClient=s.ga4.byClient||{}; s.google=s.google||defaultStore.google; s.google.byClient=s.google.byClient||{}; s.seoAudits=s.seoAudits||{}; s.reportHistory=s.reportHistory||[]; s.security=s.security||{adminPasswordHash:null}; s.whatsappThreads=s.whatsappThreads||{};
-  s.clients=s.clients.map(c=>({...c,accessCode:c.accessCode||crypto.randomBytes(4).toString("hex").toUpperCase(),plan:c.plan||"Starter",subscriptionStatus:c.subscriptionStatus||"active",subscriptionStart:c.subscriptionStart||null,subscriptionEnd:c.subscriptionEnd||null,landingPageFile:normaliseLandingPageFile(c.landingPageFile)||null}));
+  s.clients=s.clients.map(c=>({...c,accessCode:c.accessCode||crypto.randomBytes(4).toString("hex").toUpperCase(),plan:c.plan||"Starter",subscriptionStatus:c.subscriptionStatus||"active",subscriptionStart:c.subscriptionStart||null,subscriptionEnd:c.subscriptionEnd||null,landingPageFile:normaliseLandingPageFile(c.landingPageFile)||null,appsScriptWebhookUrl:String(c.appsScriptWebhookUrl||"").trim(),googleSpreadsheetId:String(c.googleSpreadsheetId||"").trim(),webhookSecret:String(c.webhookSecret||"").trim()}));
   s.leads=s.leads.map(l=>({...l,pipelineStage:l.pipelineStage||"NEW",assignedTo:l.assignedTo||null,notes:l.notes||"",responseMinutes:l.responseMinutes??null,updatedAt:l.updatedAt||l.date||new Date().toISOString()}));
   return s;
+}
+function clientRecordForResponse(c,admin=false){
+  if(admin)return c;
+  const {accessCode,appsScriptWebhookUrl,googleSpreadsheetId,webhookSecret,...safe}=c||{};
+  return safe;
 }
 
 // ---------- Password hashing (no external dependency: Node's built-in scrypt) ----------
@@ -150,21 +155,31 @@ function landingPageUrl(req,clientId,file){
   const base=process.env.APP_BASE_URL||`${req.protocol}://${req.get("host")}`;
   return `${String(base).replace(/\/$/,"")}/landing/${encodeURIComponent(clientId)}`;
 }
-function clientSettings(s,id){const c=s.clients.find(x=>x.id===id)||{};return {...s.settings,...c,clientId:id,subscription:subscriptionInfo(c),assistant:c.assistant||s.settings.assistant,customLeadFields:c.customLeadFields||s.settings.customLeadFields,scoring:c.scoring||s.settings.scoring,hotThreshold:c.hotThreshold??s.settings.hotThreshold,warmThreshold:c.warmThreshold??s.settings.warmThreshold,reportEnabled:c.reportEnabled??s.settings.reportEnabled,clientWhatsApp:c.clientWhatsApp||s.settings.clientWhatsApp||"",whatsappCountryCode:c.whatsappCountryCode||s.settings.whatsappCountryCode,landingPageFile:c.landingPageFile||null};}
-function requireAuth(req,res,next){if(!req.session.user)return res.status(401).json({error:"Authentication required"});next();}
-function requireAdmin(req,res,next){if(!req.session.user||req.session.user.role!=="admin")return res.status(403).json({error:"Admin access required"});next();}
-function selectedClient(req,s){return normaliseClientId(req.query.clientId||req.body?.clientId||req.session.user?.clientId||s.settings.clientId);}
-
-// Server-side plan gating — this is the real enforcement boundary (the
-// sidebar hiding a page is cosmetic; this is what actually blocks the
-// underlying action, regardless of whether it was triggered from the
-// dashboard UI, a chatbot's bridge call, or a direct API request).
-function clientPlanTier(s, clientId) {
-  const c = s.clients.find(x => x.id === clientId);
-  const plan = String(c?.plan || "Premium").toLowerCase().trim();
-  if (plan === "starter") return "starter";
-  if (plan === "growth") return "growth";
-  return "premium"; // Premium, and any unrecognised plan name, defaults to full access
+function clientSettings(s,id){
+  const raw=s.clients.find(x=>x.id===id)||{};
+  const {appsScriptWebhookUrl,googleSpreadsheetId,webhookSecret,accessCode,...c}=raw;
+  const base=defaultStore.settings||{};
+  return {
+    ...base,
+    ...c,
+    clientId:id,
+    businessName:c.name||base.businessName,
+    website:c.website||"",
+    reportEmail:c.reportEmail||"",
+    clientWhatsApp:c.clientWhatsApp||"",
+    whatsappCountryCode:c.whatsappCountryCode||"91",
+    subscription:subscriptionInfo(c),
+    assistant:c.assistant||s.clientProfiles?.[id]?.assistant||base.assistant,
+    customLeadFields:c.customLeadFields||s.clientProfiles?.[id]?.customLeadFields||[],
+    scoring:c.scoring||base.scoring,
+    hotThreshold:c.hotThreshold??base.hotThreshold??80,
+    warmThreshold:c.warmThreshold??base.warmThreshold??50,
+    reportEnabled:c.reportEnabled??base.reportEnabled??false,
+    landingPageFile:c.landingPageFile||null,
+    // Integration credentials are intentionally omitted from client-facing state.
+    appsScriptConfigured:!!c.appsScriptWebhookUrl,
+    spreadsheetConfigured:!!c.googleSpreadsheetId
+  };
 }
 function planHasFeature(plan, feature) {
   // feature: "visits", "documents", "testimonials" (Growth+); "team",
@@ -480,18 +495,41 @@ app.get("/api/state",requireAuth,(req,res)=>{
   const filter=x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId);
   const client=clientSettings(s,clientId);
   if(req.session.user.role!=="admin" && !client.subscription.active)return res.status(403).json({error:`Client subscription is ${client.subscription.status}. Please contact ASSISTQ to renew.`,subscription:client.subscription});
-  const profile=s.clientProfiles[clientId]||{assistant:client.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||[]};const gscClient=s.gsc.byClient[clientId]||s.gsc;const gaClient=s.ga4.byClient[clientId]||s.ga4;const out={settings:client,clientId,clients:req.session.user.role==="admin"?s.clients:s.clients.filter(c=>c.id===clientId),leads:s.leads.filter(filter).filter(x=>!x.mergedInto),conversations:Object.fromEntries(Object.entries(s.conversations).filter(([,x])=>filter(x))),keywords:s.keywords.filter(x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId)),utm:s.utm,gsc:gscClient,ga4:gaClient,seo:s.seoAudits[clientId]||null,reportHistory:s.reportHistory.filter(x=>x.clientId===clientId),profile,googleConnected:!!googleConnection(s,clientId)?.tokens,googleEmail:googleConnection(s,clientId)?.email||null,user:req.session.user};
+  const profile=s.clientProfiles[clientId]||{assistant:client.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||[]};const gscClient=s.gsc.byClient[clientId]||s.gsc;const gaClient=s.ga4.byClient[clientId]||s.ga4;const out={settings:client,clientId,clients:(req.session.user.role==="admin"?s.clients:s.clients.filter(c=>c.id===clientId)).map(c=>clientRecordForResponse(c,req.session.user.role==="admin")),leads:s.leads.filter(filter).filter(x=>!x.mergedInto),conversations:Object.fromEntries(Object.entries(s.conversations).filter(([,x])=>filter(x))),keywords:s.keywords.filter(x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId)),utm:s.utm,gsc:gscClient,ga4:gaClient,seo:s.seoAudits[clientId]||null,reportHistory:s.reportHistory.filter(x=>x.clientId===clientId),profile,googleConnected:!!googleConnection(s,clientId)?.tokens,googleEmail:googleConnection(s,clientId)?.email||null,user:req.session.user};
   writeStore(s);res.json(out);
 });
 
 app.post("/api/settings",requireAuth,(req,res)=>{
   if(req.session.user?.role==="staff")return res.status(403).json({error:"Only the business owner or an admin can change these settings."});
-  const s=ensureStoreShape(readStore());const clientId=normaliseClientId(req.body.clientId||req.session.user.clientId||s.settings.clientId);if(req.session.user.role!=="admin"&&req.session.user.clientId!==clientId)return res.status(403).json({error:"Workspace access denied"});
-  const scoring={...defaultScoring,...s.settings.scoring,...(req.body.scoring||{})};const scoringTotal=Object.values(scoring).reduce((a,w)=>a+fieldMaxPoints(w),0);if(scoringTotal!==100)return res.status(400).json({error:`Scoring max points must total 100 (currently ${scoringTotal}). For multiple-choice fields this is the highest single option's points.`});
-  s.settings={...s.settings,...req.body,clientId,scoring};const idx=s.clients.findIndex(x=>x.id===clientId);const existing=s.clients[idx]||{};const c={...existing,id:clientId,name:String(req.body.businessName||s.settings.businessName||"Client"),website:String(req.body.website||s.settings.website||""),reportEmail:String(req.body.reportEmail||s.settings.reportEmail||""),clientWhatsApp:String(req.body.clientWhatsApp||existing.clientWhatsApp||s.settings.clientWhatsApp||""),whatsappCountryCode:String(req.body.whatsappCountryCode||existing.whatsappCountryCode||s.settings.whatsappCountryCode||"91"),hotThreshold:Number(req.body.hotThreshold??existing.hotThreshold??s.settings.hotThreshold??80),warmThreshold:Number(req.body.warmThreshold??existing.warmThreshold??s.settings.warmThreshold??50),reportEnabled:req.body.reportEnabled!==undefined?!!req.body.reportEnabled:!!(existing.reportEnabled??s.settings.reportEnabled),scoring,assistant:existing.assistant||s.settings.assistant,customLeadFields:existing.customLeadFields||s.settings.customLeadFields,accessCode:existing.accessCode||crypto.randomBytes(5).toString("hex").toUpperCase(),plan:existing.plan||"Starter",subscriptionStatus:existing.subscriptionStatus||"active",subscriptionStart:existing.subscriptionStart||null,subscriptionEnd:existing.subscriptionEnd||null};if(idx>=0)s.clients[idx]={...s.clients[idx],...c};else s.clients.push(c);writeStore(s);res.json({ok:true,settings:clientSettings(s,clientId),accessCode:c.accessCode});
+  const s=ensureStoreShape(readStore());
+  const clientId=normaliseClientId(req.body.clientId||req.session.user.clientId||s.settings.clientId);
+  if(req.session.user.role!=="admin"&&req.session.user.clientId!==clientId)return res.status(403).json({error:"Workspace access denied"});
+  const idx=s.clients.findIndex(x=>x.id===clientId);
+  if(idx<0)return res.status(404).json({error:"Client not found"});
+  const existing=s.clients[idx];
+  const scoring={...defaultScoring,...(existing.scoring||{}),...(req.body.scoring||{})};
+  const scoringTotal=Object.values(scoring).reduce((a,w)=>a+fieldMaxPoints(w),0);
+  if(scoringTotal!==100)return res.status(400).json({error:`Scoring max points must total 100 (currently ${scoringTotal}). For multiple-choice fields this is the highest single option's points.`});
+  const c={...existing,
+    name:req.body.businessName!==undefined?String(req.body.businessName).trim():existing.name,
+    website:req.body.website!==undefined?String(req.body.website).trim():existing.website||"",
+    reportEmail:req.body.reportEmail!==undefined?String(req.body.reportEmail).trim():existing.reportEmail||"",
+    clientWhatsApp:req.body.clientWhatsApp!==undefined?String(req.body.clientWhatsApp).trim():existing.clientWhatsApp||"",
+    whatsappCountryCode:req.body.whatsappCountryCode!==undefined?String(req.body.whatsappCountryCode).trim():existing.whatsappCountryCode||"91",
+    hotThreshold:req.body.hotThreshold!==undefined?Number(req.body.hotThreshold):Number(existing.hotThreshold??80),
+    warmThreshold:req.body.warmThreshold!==undefined?Number(req.body.warmThreshold):Number(existing.warmThreshold??50),
+    reportEnabled:req.body.reportEnabled!==undefined?!!req.body.reportEnabled:!!(existing.reportEnabled??false),
+    scoring
+  };
+  s.clients[idx]=c;
+  // Do NOT mutate global s.settings with a client's business name/email.
+  // Global settings are now only a legacy/default template.
+  writeStore(s);
+  res.json({ok:true,settings:clientSettings(s,clientId),accessCode:c.accessCode});
 });
+
 app.get("/api/client/profile",requireAuth,(req,res)=>{const s=ensureStoreShape(readStore());const id=selectedClient(req,s);if(req.session.user.role!=="admin"&&req.session.user.clientId!==id)return res.status(403).json({error:"Workspace access denied"});const cs=clientSettings(s,id);res.json(s.clientProfiles[id]||{assistant:cs.assistant||defaultStore.settings.assistant,customLeadFields:cs.customLeadFields||[]});});
-app.post("/api/client/profile",requireAuth,(req,res)=>{if(req.session.user?.role==="staff")return res.status(403).json({error:"Only the business owner or an admin can change these settings."});const s=ensureStoreShape(readStore());const id=selectedClient(req,s);if(req.session.user.role!=="admin"&&req.session.user.clientId!==id)return res.status(403).json({error:"Workspace access denied"});const assistant={name:String(req.body.assistant?.name||"ASSISTQ Assistant").slice(0,80),greeting:String(req.body.assistant?.greeting||"Hi! 👋 What can I help you with today?").slice(0,300),tone:String(req.body.assistant?.tone||"Professional, friendly and concise").slice(0,300),knowledge:String(req.body.assistant?.knowledge||"").slice(0,12000),questions:Array.isArray(req.body.assistant?.questions)?req.body.assistant.questions.slice(0,20):[]};const customLeadFields=Array.isArray(req.body.customLeadFields)?req.body.customLeadFields.slice(0,30).map(x=>({key:String(x.key||"").trim().toLowerCase().replace(/[^a-z0-9_]/g,"_").slice(0,40),label:String(x.label||"").trim().slice(0,80),required:!!x.required})).filter(x=>x.key&&x.label):[];s.clientProfiles[id]={assistant,customLeadFields};const idx=s.clients.findIndex(x=>x.id===id);if(idx>=0)s.clients[idx]={...s.clients[idx],assistant,customLeadFields};if(id===s.settings.clientId)s.settings={...s.settings,assistant,customLeadFields};writeStore(s);res.json({ok:true,profile:s.clientProfiles[id]});});
+app.post("/api/client/profile",requireAuth,(req,res)=>{if(req.session.user?.role==="staff")return res.status(403).json({error:"Only the business owner or an admin can change these settings."});const s=ensureStoreShape(readStore());const id=selectedClient(req,s);if(req.session.user.role!=="admin"&&req.session.user.clientId!==id)return res.status(403).json({error:"Workspace access denied"});const assistant={name:String(req.body.assistant?.name||"ASSISTQ Assistant").slice(0,80),greeting:String(req.body.assistant?.greeting||"Hi! 👋 What can I help you with today?").slice(0,300),tone:String(req.body.assistant?.tone||"Professional, friendly and concise").slice(0,300),knowledge:String(req.body.assistant?.knowledge||"").slice(0,12000),questions:Array.isArray(req.body.assistant?.questions)?req.body.assistant.questions.slice(0,20):[]};const customLeadFields=Array.isArray(req.body.customLeadFields)?req.body.customLeadFields.slice(0,30).map(x=>({key:String(x.key||"").trim().toLowerCase().replace(/[^a-z0-9_]/g,"_").slice(0,40),label:String(x.label||"").trim().slice(0,80),required:!!x.required})).filter(x=>x.key&&x.label):[];s.clientProfiles[id]={assistant,customLeadFields};const idx=s.clients.findIndex(x=>x.id===id);if(idx>=0)s.clients[idx]={...s.clients[idx],assistant,customLeadFields};writeStore(s);res.json({ok:true,profile:s.clientProfiles[id]});});
 
 app.post("/api/clients",requireAdmin,(req,res)=>{
   const s=ensureStoreShape(readStore());
@@ -501,11 +539,26 @@ app.post("/api/clients",requireAdmin,(req,res)=>{
   const requestedLanding=req.body.landingPageFile?String(req.body.landingPageFile):"";
   const landingPageFile=requestedLanding?normaliseLandingPageFile(requestedLanding):null;
   if(requestedLanding&&!landingPageFile)return res.status(400).json({error:"Invalid landing page. Choose an HTML file from the available public/ landing pages."});
-  const c={id,name:String(req.body.name),website:String(req.body.website||""),reportEmail:String(req.body.reportEmail||""),clientWhatsApp:String(req.body.clientWhatsApp||""),accessCode:crypto.randomBytes(5).toString("hex").toUpperCase(),plan:String(req.body.plan||"Starter"),subscriptionStatus:"active",subscriptionStart:req.body.subscriptionStart||new Date().toISOString(),subscriptionEnd:req.body.subscriptionEnd||null,landingPageFile};
+  const webhook=String(req.body.appsScriptWebhookUrl||"").trim();
+  if(webhook&&!/^https:\/\/script\.google\.com\/macros\/s\//i.test(webhook))return res.status(400).json({error:"Google Apps Script webhook must be the deployed HTTPS /exec URL."});
+  const c={id,name:String(req.body.name).trim(),website:String(req.body.website||"").trim(),reportEmail:String(req.body.reportEmail||"").trim(),clientWhatsApp:String(req.body.clientWhatsApp||"").trim(),whatsappCountryCode:String(req.body.whatsappCountryCode||"91").trim(),accessCode:crypto.randomBytes(5).toString("hex").toUpperCase(),plan:String(req.body.plan||"Starter"),subscriptionStatus:"active",subscriptionStart:req.body.subscriptionStart||new Date().toISOString(),subscriptionEnd:req.body.subscriptionEnd||null,landingPageFile,appsScriptWebhookUrl:webhook,googleSpreadsheetId:String(req.body.googleSpreadsheetId||"").trim(),webhookSecret:String(req.body.webhookSecret||"").trim()};
   s.clients.push(c);
-  s.settings={...s.settings,clientId:id,businessName:c.name,website:c.website,reportEmail:c.reportEmail};
+  // Never copy a new client's identity into global settings.
   writeStore(s);
-  res.status(201).json({...c,landingPageUrl:landingPageFile?landingPageUrl(req,id,landingPageFile):null});
+  res.status(201).json({...c,landingPageUrl:landingPageFile?landingPageUrl(req,id,landingPageFile):null,appsScriptConfigured:!!webhook,spreadsheetConfigured:!!c.googleSpreadsheetId});
+});
+
+app.post("/api/clients/:id/integrations",requireAdmin,(req,res)=>{
+  const s=ensureStoreShape(readStore());
+  const id=normaliseClientId(req.params.id);
+  const idx=s.clients.findIndex(x=>x.id===id);
+  if(idx<0)return res.status(404).json({error:"Client not found"});
+  const webhook=String(req.body.appsScriptWebhookUrl||"").trim();
+  if(webhook&&!/^https:\/\/script\.google\.com\/macros\/s\//i.test(webhook))return res.status(400).json({error:"Google Apps Script webhook must be the deployed HTTPS /exec URL."});
+  const c={...s.clients[idx],appsScriptWebhookUrl:webhook,googleSpreadsheetId:String(req.body.googleSpreadsheetId||"").trim(),webhookSecret:(String(req.body.webhookSecret||"").trim()||s.clients[idx].webhookSecret||"")};
+  s.clients[idx]=c;
+  writeStore(s);
+  res.json({ok:true,client:{...c,appsScriptWebhookUrl:undefined,webhookSecret:undefined},appsScriptConfigured:!!webhook,spreadsheetConfigured:!!c.googleSpreadsheetId});
 });
 
 app.post("/api/clients/:id/landing-page",requireAdmin,(req,res)=>{
@@ -610,9 +663,14 @@ app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,as
   if(!req.body || !req.body.action){
     return res.status(400).json({status:"error",message:"Chatbot request is missing action. Refresh the chatbot page to load the latest AssistQ widget."});
   }
-  const upstream=String(process.env.APPS_SCRIPT_WEBHOOK_URL||"").trim();
-  if(!upstream)return res.status(503).json({status:"error",message:"Chatbot backend is not configured. Set APPS_SCRIPT_WEBHOOK_URL on the server."});
-  if(!/^https:\/\/script\.google\.com\/macros\/s\//i.test(upstream))return res.status(500).json({status:"error",message:"APPS_SCRIPT_WEBHOOK_URL must be a deployed Google Apps Script /exec URL."});
+  const s=ensureStoreShape(readStore());
+  const clientId=normaliseClientId(req.body.clientId||req.assistqClientId);
+  const client=s.clients.find(c=>c.id===clientId);
+  if(!client)return res.status(404).json({status:"error",message:"Client not found"});
+  const upstream=String(client.appsScriptWebhookUrl||"").trim();
+  if(!upstream)return res.status(503).json({status:"error",message:`No Google Apps Script webhook is configured for ${client.name||clientId}. Ask an AssistQ admin to configure this client.`});
+  if(!/^https:\/\/script\.google\.com\/macros\/s\//i.test(upstream))return res.status(500).json({status:"error",message:"This client's Google Apps Script webhook must be a deployed /exec URL."});
+  const forwarded={...req.body,clientId,googleSpreadsheetId:String(client.googleSpreadsheetId||""),businessName:String(client.name||""),reportEmail:String(client.reportEmail||""),clientWhatsApp:String(client.clientWhatsApp||""),webhookSecret:String(client.webhookSecret||""),assistant:client.assistant||s.clientProfiles?.[clientId]?.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||s.clientProfiles?.[clientId]?.customLeadFields||[],scoring:client.scoring||defaultScoring,hotThreshold:Number(client.hotThreshold??80),warmThreshold:Number(client.warmThreshold??50)};
   try{
     const controller=new AbortController();
     const timer=setTimeout(()=>controller.abort(),25000);
@@ -622,8 +680,8 @@ app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,as
         method:"POST",
         redirect:"follow",
         signal:controller.signal,
-        headers:{"Content-Type":"application/json","Accept":"application/json"},
-        body:JSON.stringify(req.body||{})
+        headers:{"Content-Type":"application/json","Accept":"application/json",...(client.webhookSecret?{"X-ASSISTQ-WEBHOOK-SECRET":client.webhookSecret}: {})},
+        body:JSON.stringify(forwarded)
       });
     }finally{clearTimeout(timer);}
     const text=await r.text();
@@ -633,7 +691,7 @@ app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,as
       return res.status(502).json({
         status:"error",
         message:looksGoogleHtml
-          ? "Google Apps Script returned an HTML login/security page. Redeploy the script as Web app: Execute as Me, Who has access: Anyone, then update APPS_SCRIPT_WEBHOOK_URL to the current /exec URL."
+          ? "Google Apps Script returned an HTML login/security page. Redeploy the script as Web app: Execute as Me, Who has access: Anyone, then update this client's Google Apps Script webhook URL to the current /exec URL."
           : `Apps Script returned non-JSON (HTTP ${r.status}). Check the deployment URL and Apps Script execution logs.`
       });
     }
