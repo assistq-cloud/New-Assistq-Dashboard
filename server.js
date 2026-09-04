@@ -124,6 +124,11 @@ function configureSessions() {
   }));
 }
 
+// Register the session middleware BEFORE any route that reads or writes
+// req.session. initDB() is awaited before app.listen(), so the Postgres pool
+// is ready by the time a request can reach this middleware.
+configureSessions();
+
 // Basic production hardening. Put the app behind HTTPS in production.
 // NOTE: /widget.html is the embeddable chat-bubble widget — it is meant to
 // be loaded inside an <iframe> on a CLIENT's own website, which is always a
@@ -1214,7 +1219,16 @@ app.use((req,res,next)=>{if(req.method!=="GET")return next();if(req.path.startsW
 setInterval(processRealEstateAutomation,60000);
 try {
   await initDB(defaultStore);
-  configureSessions();
+  if (process.env.NODE_ENV === "production") {
+    const sessionSecret = String(process.env.SESSION_SECRET || "");
+    if (sessionSecret.length < 32) {
+      throw new Error("SESSION_SECRET must be set to a random value of at least 32 characters in production.");
+    }
+    const currentStore = ensureStoreShape(readStore());
+    if (!currentStore.security?.adminPasswordHash && (!process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD === "ChangeMe123!")) {
+      throw new Error("Set a strong ADMIN_PASSWORD in production before first admin login.");
+    }
+  }
   const server = app.listen(PORT,()=>console.log(`ASSISTQ Growth Platform running on port ${PORT}`));
   setInterval(() => {
     getDBPool().query("DELETE FROM assistq_sessions WHERE expire <= now()").catch(e =>
