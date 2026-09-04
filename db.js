@@ -41,6 +41,11 @@ import pg from "pg";
 const { Pool } = pg;
 
 let pool = null;
+
+export function getDBPool() {
+  if (!pool) throw new Error("Postgres is not initialized yet.");
+  return pool;
+}
 let cachedStore = null;       // the full merged object, exactly as before
 let writeChain = Promise.resolve();
 let lastWrittenGlobal = null;               // JSON string of last-persisted global slice
@@ -217,6 +222,17 @@ async function ensureTables() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_assistq_client_data_updated ON assistq_client_data (updated_at);`);
+  // Persistent session storage for Railway production. The default
+  // express-session MemoryStore loses all login sessions whenever the
+  // process restarts or a new deployment replaces the container.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS assistq_sessions (
+      sid TEXT PRIMARY KEY,
+      sess JSONB NOT NULL,
+      expire TIMESTAMPTZ NOT NULL
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_assistq_sessions_expire ON assistq_sessions (expire);`);
 }
 
 // One-time migration path: if this deployment previously used the old
@@ -351,9 +367,24 @@ export function writeStore(s) {
   cachedStore = s;
   const { global, shards } = partitionStore(s);
   writeChain = writeChain
-    .then(() => persist(global, shards, false))
+    .then(async () => {
+      let lastErr;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          await persist(global, shards, false);
+          return;
+        } catch (err) {
+          lastErr = err;
+          console.error(`ASSISTQ: Postgres write failed (attempt ${attempt}/5):`, err.message);
+          if (attempt < 5) await new Promise(r => setTimeout(r, Math.min(2000 * attempt, 8000)));
+        }
+      }
+      // Do not silently pretend the write succeeded. The dirty cache remains
+      // in memory, and the error is explicit in logs for Railway monitoring.
+      throw lastErr;
+    })
     .catch((err) => {
-      console.error("ASSISTQ: failed to persist store to Postgres", err);
+      console.error("ASSISTQ: CRITICAL — data could not be persisted to Postgres after retries:", err.message);
     });
 }
 
