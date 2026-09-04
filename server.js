@@ -387,9 +387,9 @@ app.get("/api/admin/landing-pages",requireAdmin,(req,res)=>{
   res.json({files:availableLandingPages()});
 });
 
-// Public client landing-page route. The selected HTML file is served server-side
-// and ASSISTQ's floating chatbot is injected automatically, so the client gets
-// one shareable URL without editing the HTML file itself.
+// Public client landing-page route. The selected HTML file is served server-side.
+// Pages with a custom AssistQ chatbot keep their own single chatbot; pages
+// without one receive the standard AssistQ embed automatically.
 app.get("/landing/:clientId",rateLimit("public-landing",120,60000),(req,res)=>{
   const s=ensureStoreShape(readStore());
   const id=normaliseClientId(req.params.clientId);
@@ -403,9 +403,31 @@ app.get("/landing/:clientId",rateLimit("public-landing",120,60000),(req,res)=>{
   let html;
   try{html=fs.readFileSync(full,"utf8");}catch{return res.status(404).send("Landing page file not found in the deployed public folder.");}
   const dashboardUrl=String(process.env.APP_BASE_URL||`${req.protocol}://${req.get("host")}`).replace(/\/$/,"");
-  const embed=`<script src="${dashboardUrl}/embed.js" data-client="${id}" data-dashboard="${dashboardUrl}"></script>`;
-  if(/<\/body>/i.test(html)) html=html.replace(/<\/body>/i,`${embed}\n</body>`);
-  else html+=`\n${embed}`;
+
+  // Custom landing pages may already contain their own AssistQ chatbot UI.
+  // In that case, do NOT inject the generic embed widget: otherwise the page
+  // would show two launchers and the custom page's Chat buttons could open
+  // the wrong/second chatbot. Pages using the built-in custom chatbot are
+  // detected by their launcher + panel IDs (or the explicit marker below).
+  const hasCustomChatbot = /data-assistq-custom-chatbot\s*=\s*["']?true["']?/i.test(html)
+    || (/<(?:button|div)[^>]+id\s*=\s*["']launcher["']/i.test(html)
+        && /<(?:div|section)[^>]+id\s*=\s*["']panel["']/i.test(html));
+
+  // Always provide the selected client's ID to custom landing pages.
+  // Custom pages can read window.ASSISTQ_LANDING_CLIENT_ID and therefore
+  // do not need to be edited separately for every client.
+  const landingConfig=`<script>window.ASSISTQ_LANDING_CLIENT_ID=${JSON.stringify(id)};window.ASSISTQ_DASHBOARD_URL=${JSON.stringify(dashboardUrl)};</script>`;
+
+  if (/<\/head>/i.test(html)) html=html.replace(/<\/head>/i,`${landingConfig}\n</head>`);
+  else if (/<\/body>/i.test(html)) html=html.replace(/<\/body>/i,`${landingConfig}\n</body>`);
+  else html=`${landingConfig}\n${html}`;
+
+  if(!hasCustomChatbot){
+    const embed=`<script src="${dashboardUrl}/embed.js" data-client="${id}" data-dashboard="${dashboardUrl}"></script>`;
+    if(/<\/body>/i.test(html)) html=html.replace(/<\/body>/i,`${embed}\n</body>`);
+    else html+=`\n${embed}`;
+  }
+
   res.setHeader("Content-Type","text/html; charset=utf-8");
   res.setHeader("Cache-Control","no-store");
   res.send(html);
