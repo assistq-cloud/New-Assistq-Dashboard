@@ -73,7 +73,13 @@
   // Resolves an object keyed by field id, or null if cancelled.
   window.modalPrompt = function (title, fields, opts = {}) {
     return new Promise(resolve => {
-      const rows = fields.map(f => `<div class="field"><label>${escapeHtml(f.label)}${f.required ? " *" : ""}</label><input class="modalInput" data-key="${f.id}" type="${f.type || "text"}" placeholder="${escapeHtml(f.placeholder || "")}" value="${escapeHtml(f.value ?? "")}"></div>`).join("");
+      const rows = fields.map(f => {
+        if (f.type === "select") {
+          const options = (f.options || []).map(o => { const value = typeof o === "string" ? o : o.value; const label = typeof o === "string" ? o : (o.label ?? o.value); return `<option value="${escapeHtml(value)}" ${String(value)===String(f.value??"")?"selected":""}>${escapeHtml(label)}</option>`; }).join("");
+          return `<div class="field"><label>${escapeHtml(f.label)}${f.required ? " *" : ""}</label><select class="modalInput" data-key="${f.id}">${options}</select></div>`;
+        }
+        return `<div class="field"><label>${escapeHtml(f.label)}${f.required ? " *" : ""}</label><input class="modalInput" data-key="${f.id}" type="${f.type || "text"}" placeholder="${escapeHtml(f.placeholder || "")}" value="${escapeHtml(f.value ?? "")}"></div>`;
+      }).join("");
       const overlay = openOverlay(`
         <div class="modalHead"><h3>${escapeHtml(title)}</h3><button class="modalClose" data-act="cancel">✕</button></div>
         <div class="modalBody"><div class="form" style="grid-template-columns:1fr">${rows}</div><div class="modalError"></div></div>
