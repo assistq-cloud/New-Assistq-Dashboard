@@ -513,6 +513,48 @@ app.get("/api/ga4/properties",requireAuth,requireGoogle,async(req,res)=>{
 app.post("/api/ga4/sync",requireAuth,requireGoogle,async(req,res)=>{try{const {propertyId}=req.body;if(!propertyId)return res.status(400).json({error:"propertyId required"});const {client,id}=googleAuthClientFor(req);const r=await google.analyticsdata({version:"v1beta",auth:client}).properties.runReport({property:`properties/${propertyId}`,requestBody:{dateRanges:[{startDate:"30daysAgo",endDate:"today"}],dimensions:[{name:"date"}],metrics:[{name:"activeUsers"},{name:"sessions"},{name:"conversions"}]}});const rows=(r.data.rows||[]).map(x=>({date:x.dimensionValues?.[0]?.value,activeUsers:Number(x.metricValues?.[0]?.value||0),sessions:Number(x.metricValues?.[1]?.value||0),conversions:Number(x.metricValues?.[2]?.value||0)}));const totals=rows.reduce((a,x)=>({users:a.users+x.activeUsers,sessions:a.sessions+x.sessions,conversions:a.conversions+x.conversions}),{users:0,sessions:0,conversions:0});const s=ensureStoreShape(readStore());s.ga4.byClient[id]={connected:true,propertyId,rows,metrics:totals,syncedAt:new Date().toISOString()};writeStore(s);res.json(s.ga4.byClient[id]);}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/google/test-email",requireAuth,requireGoogle,async(req,res)=>{try{const {client,id}=googleAuthClientFor(req);const to=String(req.body.to||clientSettings(ensureStoreShape(readStore()),id).reportEmail||"").trim();if(!to)return res.status(400).json({error:"Enter a test email address first."});const subject="ASSISTQ Google connection test";const body="Your Google account is connected to ASSISTQ. This is a test email.";const raw=Buffer.from([`To: ${to}`,`Subject: ${subject}`,"Content-Type: text/plain; charset=utf-8","",body].join("\r\n")).toString("base64url");await google.gmail({version:"v1",auth:client}).users.messages.send({userId:"me",requestBody:{raw}});res.json({ok:true,to});}catch(e){res.status(500).json({error:e.message});}});
 
+// ---------- Public chatbot AI proxy ----------
+// The browser should never POST directly to script.google.com. Doing that can
+// occasionally return Google's HTML login/security shell instead of the JSON
+// produced by Apps Script. This server-side proxy keeps the browser on the
+// ASSISTQ origin, follows redirects on the server, validates the upstream
+// response, and ALWAYS returns JSON to the widget.
+app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,async(req,res)=>{
+  const upstream=String(process.env.APPS_SCRIPT_WEBHOOK_URL||"").trim();
+  if(!upstream)return res.status(503).json({status:"error",message:"Chatbot backend is not configured. Set APPS_SCRIPT_WEBHOOK_URL on the server."});
+  if(!/^https:\/\/script\.google\.com\/macros\/s\//i.test(upstream))return res.status(500).json({status:"error",message:"APPS_SCRIPT_WEBHOOK_URL must be a deployed Google Apps Script /exec URL."});
+  try{
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),25000);
+    let r;
+    try{
+      r=await fetch(upstream,{
+        method:"POST",
+        redirect:"follow",
+        signal:controller.signal,
+        headers:{"Content-Type":"application/json","Accept":"application/json"},
+        body:JSON.stringify(req.body||{})
+      });
+    }finally{clearTimeout(timer);}
+    const text=await r.text();
+    let data;
+    try{data=JSON.parse(text);}catch{
+      const looksGoogleHtml=/<!doctype html|<html|ppConfig|accounts\.google\.com/i.test(text);
+      return res.status(502).json({
+        status:"error",
+        message:looksGoogleHtml
+          ? "Google Apps Script returned an HTML login/security page. Redeploy the script as Web app: Execute as Me, Who has access: Anyone, then update APPS_SCRIPT_WEBHOOK_URL to the current /exec URL."
+          : `Apps Script returned non-JSON (HTTP ${r.status}). Check the deployment URL and Apps Script execution logs.`
+      });
+    }
+    if(!r.ok)return res.status(502).json({status:"error",message:data?.message||data?.error||`Apps Script HTTP ${r.status}`});
+    return res.json(data);
+  }catch(e){
+    const msg=e?.name==="AbortError"?"Apps Script timed out after 25 seconds.":e.message;
+    return res.status(502).json({status:"error",message:"Could not reach Apps Script: "+msg});
+  }
+});
+
 // ---------- Leads / chatbot bridge ----------
 function saveConversationEvent(body){const s=ensureStoreShape(readStore());const clientId=normaliseClientId(body.clientId||s.settings.clientId);const id=body.leadId||"lead_"+crypto.randomBytes(6).toString("hex");const now=new Date().toISOString();const existing=s.conversations[id]||{id,clientId,createdAt:now,updatedAt:now,fields:{},utm:{},messages:[],score:0,status:"COLD"};if(body.event?.role&&body.event?.content){const last=existing.messages.at(-1);if(!(last&&last.role===body.event.role&&last.content===body.event.content))existing.messages.push({role:body.event.role,content:String(body.event.content).slice(0,8000),at:body.event.at||now});}existing.fields={...existing.fields,...normaliseFields(body.fields||{})};existing.utm={...existing.utm,...cleanUTM(body.utm||{})};existing.clientId=clientId;existing.updatedAt=now;const cs=clientSettings(s,clientId);existing.score=scoreLead(existing.fields,existing.messages,cs);existing.scoreBreakdown=scoreBreakdown(existing.fields,existing.messages,cs);existing.status=statusFor(existing.score,cs);s.conversations[id]=existing;writeStore(s);return existing;}
 // Before this, matching was a raw substring check ("does the lead's text
