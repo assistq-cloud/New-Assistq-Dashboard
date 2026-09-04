@@ -563,7 +563,7 @@ const CONFIG = {
   // One Apps Script deployment can serve all clients. Prefer URL parameters
   // for per-client setup so this file does not need to be edited every time.
   webhookUrl: "",
-  dashboardUrl: "https://assistq.in",
+  dashboardUrl: "https://app.assistq.in",
   clientId: "sonqai-technologies",
   businessName: "This Business",
   greeting: "Hi! 👋 What's your name?",
@@ -594,10 +594,8 @@ const leadId = "lead_" + Date.now() + "_" + Math.random().toString(36).slice(2, 
 const params = new URLSearchParams(window.location.search);
 const clientFromUrl = params.get("clientId");
 const dashboardFromUrl = params.get("dashboardUrl");
-const webhookFromUrl = params.get("webhookUrl");
 if (clientFromUrl) CONFIG.clientId = clientFromUrl;
 if (dashboardFromUrl) CONFIG.dashboardUrl = dashboardFromUrl.replace(/\/$/, "");
-if (webhookFromUrl) CONFIG.webhookUrl = webhookFromUrl;
 if (!CONFIG.webhookUrl && CONFIG.dashboardUrl) CONFIG.webhookUrl = CONFIG.dashboardUrl + "/api/chatbot";
 
 // Capture UTM tracking params from the URL.
@@ -794,6 +792,7 @@ async function sendMessage(optionText) {
   try {
     const res = await fetch(CONFIG.webhookUrl, {
       method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
       body: JSON.stringify({ action: "chat", leadId: leadId, messages: conversation, knownFields: knownFields, clientId: CONFIG.clientId, dashboardUrl: CONFIG.dashboardUrl, businessName: CONFIG.businessName })
     });
 
@@ -856,6 +855,7 @@ async function submitLead() {
   try {
     const res = await fetch(CONFIG.webhookUrl, {
       method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
       body: JSON.stringify({ action: "submit", leadId: leadId, fields: knownFields, utm: utm, clientId: CONFIG.clientId, businessName: CONFIG.businessName })
     });
     const rawText = await res.text();
