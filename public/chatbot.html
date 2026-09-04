@@ -842,7 +842,7 @@ async function sendMessage(optionText) {
 
   } catch (err) {
     typingEl.remove();
-    addMessage("error", "Request failed: " + err.message + " (check the webhookUrl and your internet connection)");
+    addMessage("error", "Request failed: " + err.message + " (check the AssistQ backend connection and your internet connection)");
   }
 
   sendBtn.disabled = false;
@@ -930,7 +930,7 @@ document.querySelectorAll(".statItem .num").forEach(el => {
 (function diagnostics() {
   const warn = (msg) => console.warn("%cASSISTQ setup:", "color:#e2703a;font-weight:bold", msg);
   if (!CONFIG.webhookUrl || CONFIG.webhookUrl.includes("PASTE_")) {
-    warn("webhookUrl is not set — the chat can't get AI replies until this client's Apps Script URL is pasted into CONFIG.webhookUrl.");
+    warn("AssistQ backend is not configured — refresh the page and make sure the dashboard URL is correct.");
   }
   if (!CONFIG.dashboardUrl || CONFIG.dashboardUrl.includes("PASTE_")) {
     warn("dashboardUrl is not set — leads/conversations won't appear in the Growth Platform dashboard, and subscription gating won't apply.");
