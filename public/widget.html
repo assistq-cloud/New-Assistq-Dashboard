@@ -126,7 +126,7 @@
 // public/chatbot.html's ?clientId=&dashboardUrl= support.
 const params = new URLSearchParams(window.location.search);
 const CONFIG = {
-  webhookUrl: params.get("webhookUrl") || "",
+  webhookUrl: "",
   dashboardUrl: (params.get("dashboardUrl") || "https://app.assistq.in").replace(/\/$/, ""),
   clientId: params.get("clientId") || "",
   businessName: params.get("businessName") || "This Business",
@@ -362,7 +362,7 @@ async function sendMessage(optionText) {
     } else { showOptionsIfAny(); }
   } catch (err) {
     typingEl.remove();
-    addMessage("error", "Request failed: " + err.message + " (check the webhookUrl and your internet connection)");
+    addMessage("error", "Request failed: " + err.message + " (check the AssistQ backend connection and your internet connection)");
   }
   sendBtn.disabled = false;
   textInput.focus();
