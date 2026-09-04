@@ -127,7 +127,7 @@
 const params = new URLSearchParams(window.location.search);
 const CONFIG = {
   webhookUrl: params.get("webhookUrl") || "",
-  dashboardUrl: (params.get("dashboardUrl") || "https://assistq.in").replace(/\/$/, ""),
+  dashboardUrl: (params.get("dashboardUrl") || "https://app.assistq.in").replace(/\/$/, ""),
   clientId: params.get("clientId") || "",
   businessName: params.get("businessName") || "This Business",
   greeting: "Hi! 👋 What's your name?",
@@ -292,7 +292,7 @@ async function submitLead() {
   if (CONFIG.subscriptionActive === false) { addMessage("error", "This assistant is temporarily unavailable. Please contact the business."); return; }
   await bridgeLead();
   try {
-    const res = await fetch(CONFIG.webhookUrl, { method: "POST", body: JSON.stringify({ action: "submit", leadId, fields: knownFields, utm, clientId: CONFIG.clientId, businessName: CONFIG.businessName }) });
+    const res = await fetch(CONFIG.webhookUrl, { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" }, body: JSON.stringify({ action: "submit", leadId, fields: knownFields, utm, clientId: CONFIG.clientId, businessName: CONFIG.businessName }) });
     const rawText = await res.text();
     let data; try { data = JSON.parse(rawText); } catch (e) { data = null; }
     if (!data || data.status !== "success") addMessage("error", "Lead submit failed: " + (data ? data.message : rawText.slice(0, 300)));
@@ -338,7 +338,7 @@ async function sendMessage(optionText) {
   const typingEl = addMessage("bot", "...");
 
   try {
-    const res = await fetch(CONFIG.webhookUrl, { method: "POST", body: JSON.stringify({ action: "chat", leadId, messages: conversation, knownFields, clientId: CONFIG.clientId, dashboardUrl: CONFIG.dashboardUrl, businessName: CONFIG.businessName }) });
+    const res = await fetch(CONFIG.webhookUrl, { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" }, body: JSON.stringify({ action: "chat", leadId, messages: conversation, knownFields, clientId: CONFIG.clientId, dashboardUrl: CONFIG.dashboardUrl, businessName: CONFIG.businessName }) });
     const rawText = await res.text();
     let data;
     try { data = JSON.parse(rawText); } catch (parseErr) {
