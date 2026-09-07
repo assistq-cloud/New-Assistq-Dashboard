@@ -204,7 +204,7 @@ function normaliseLandingPageFile(file){
   if(!value||value.includes("..")||value.startsWith("/")||!/^[-a-zA-Z0-9_./]+\.html$/i.test(value))return "";
   const base=path.basename(value);
   if(base.toLowerCase()!==value.toLowerCase())return "";
-  const reserved=new Set(["index.html","chatbot.html","widget.html"]);
+  const reserved=new Set(["index.html","widget.html"]);
   if(reserved.has(base.toLowerCase()))return "";
   const publicDir=path.join(__dirname,"public");
   const target=path.resolve(publicDir,base);
@@ -215,7 +215,7 @@ function availableLandingPages(){
   const publicDir=path.join(__dirname,"public");
   try{
     return fs.readdirSync(publicDir,{withFileTypes:true})
-      .filter(e=>e.isFile()&&/\.html$/i.test(e.name)&&!new Set(["index.html","chatbot.html","widget.html"]).has(e.name.toLowerCase()))
+      .filter(e=>e.isFile()&&/\.html$/i.test(e.name)&&!new Set(["index.html","widget.html"]).has(e.name.toLowerCase()))
       .map(e=>e.name)
       .sort((a,b)=>a.localeCompare(b));
   }catch{return [];}
@@ -879,9 +879,9 @@ app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,as
   const clientId=normaliseClientId(req.body.clientId||req.assistqClientId);
   const client=s.clients.find(c=>c.id===clientId);
   if(!client)return res.status(404).json({status:"error",message:"Client not found"});
-  const upstream=String(client.appsScriptWebhookUrl||"").trim();
+  const upstream=String(client.appsScriptWebhookUrl||"").trim().replace(/[?#].*$/,"");
   if(!upstream)return res.status(503).json({status:"error",message:`No Google Apps Script webhook is configured for ${client.name||clientId}. Ask an AssistQ admin to configure this client.`});
-  if(!/^https:\/\/script\.google\.com\/macros\/s\//i.test(upstream))return res.status(500).json({status:"error",message:"This client's Google Apps Script webhook must be a deployed /exec URL."});
+  if(!/^https:\/\/script\.google\.com\/macros\/s\/[^\\s/]+\/exec$/i.test(upstream))return res.status(500).json({status:"error",message:"This client's Google Apps Script webhook must be the deployed Google Apps Script /exec URL."});
   const forwarded={...req.body,clientId,googleSpreadsheetId:String(client.googleSpreadsheetId||""),businessName:String(client.name||""),reportEmail:String(client.reportEmail||""),clientWhatsApp:String(client.clientWhatsApp||""),webhookSecret:String(client.webhookSecret||""),assistant:client.assistant||s.clientProfiles?.[clientId]?.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||s.clientProfiles?.[clientId]?.customLeadFields||[],scoring:client.scoring||defaultScoring,hotThreshold:Number(client.hotThreshold??80),warmThreshold:Number(client.warmThreshold??50)};
   try{
     const controller=new AbortController();
@@ -1469,6 +1469,17 @@ setInterval(async()=>{
     }
   }catch(e){console.error("ASSISTQ SEO audit scheduler",e.message);}
 },6*60*60*1000);
+
+// Final API error boundary: never let an unexpected server exception turn into an HTML 500 page.
+// Browser chatbots always receive JSON, which prevents "Server returned HTTP 500 instead of JSON" errors.
+app.use((err,req,res,next)=>{
+  console.error("ASSISTQ unhandled request error:",err?.stack||err?.message||err);
+  if(req.path.startsWith("/api/")||req.path.startsWith("/auth/")){
+    if(res.headersSent)return next(err);
+    return res.status(500).json({status:"error",error:"Internal server error",message:"AssistQ could not complete this request. Check the Railway server logs for the underlying error."});
+  }
+  next(err);
+});
 
 app.use((req,res,next)=>{if(req.method!=="GET")return next();if(req.path.startsWith("/api/")||req.path.startsWith("/auth/"))return res.status(404).end();res.sendFile(path.join(__dirname,"public","index.html"));});
 
