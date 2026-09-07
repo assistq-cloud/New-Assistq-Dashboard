@@ -53,7 +53,7 @@ let lastWrittenClient = new Map();          // clientId -> JSON string of last-p
 
 // ---------- schema classification (see note above) ----------
 const PER_CLIENT_ARRAY_KEYS = ["keywords", "leads", "reportHistory"];
-const PER_CLIENT_OBJECT_KEYS = ["clientProfiles", "seoAudits", "whatsappThreads"];
+const PER_CLIENT_OBJECT_KEYS = ["clientProfiles", "seoAudits", "whatsappThreads", "integrationsByClient"];
 const RE_ARRAY_KEYS = ["projects","team","visits","followups","activities","inventory","channelPartners","adSpend","documents","commissions","possession","testimonials"];
 const RE_OBJECT_KEYS = ["automationByClient","roundRobin"];
 
@@ -164,7 +164,10 @@ function mergeStore(global, shardEntries /* iterable of [clientId, shard] */) {
     gsc: { ...(global.gsc || {}), byClient: {} },
     ga4: { ...(global.ga4 || {}), byClient: {} },
     google: { byClient: {} },
-    realEstate: { automation: global.realEstate?.automation, automationByClient: {}, roundRobin: {} }
+    realEstate: { automation: global.realEstate?.automation, automationByClient: {}, roundRobin: {} },
+    // Legacy v8 builds stored integrations in the global row. Keep reading that
+    // field so the first write safely migrates it into the per-client shard.
+    integrationsByClient: { ...(global.integrationsByClient || {}) }
   };
   for (const key of RE_ARRAY_KEYS) s.realEstate[key] = [];
 
