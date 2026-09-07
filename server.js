@@ -1211,8 +1211,55 @@ app.post("/api/realestate/leads/:id/merge",requireAuth,(req,res)=>{
 // HTML. Abuse is bounded by rateLimit() below instead. WEBHOOK_SECRET remains
 // required for /api/leads, which is for trusted server-to-server integrations
 // (Tally, Zapier, etc.) rather than the public browser widget.
-app.post("/api/bridge/conversation",rateLimit("conversation",120,60000),requireActiveClient,(req,res)=>{try{res.json({ok:true,conversation:saveConversationEvent(req.body||{})});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/bridge/lead",rateLimit("lead",60,60000),requireActiveClient,(req,res)=>{try{const s=readStore();const c=req.body.conversationId?s.conversations[req.body.conversationId]:null;const body={...req.body,fields:normaliseFields(req.body.fields||c?.fields||{}),messages:Array.isArray(req.body.messages)?req.body.messages:(c?.messages||[]),utm:req.body.utm||c?.utm||{}};res.status(201).json({ok:true,lead:saveLeadInternal(body)});}catch(e){res.status(500).json({error:e.message});}});
+// Public chatbot requests can arrive almost simultaneously (for example a
+// conversation event immediately followed by a lead snapshot). Because the
+// legacy persistence API is synchronous-looking, two requests could previously
+// read the same old store and the later write could overwrite the first request.
+// Serialize only these two public bridge mutations so conversation messages and
+// lead snapshots can never clobber one another.
+let bridgeWriteQueue = Promise.resolve();
+function enqueueBridgeMutation(fn){
+  const run = bridgeWriteQueue.then(fn, fn);
+  bridgeWriteQueue = run.catch(()=>{});
+  return run;
+}
+
+app.post("/api/bridge/conversation",rateLimit("conversation",120,60000),requireActiveClient,async(req,res)=>{
+  try{
+    const conversation=await enqueueBridgeMutation(()=>saveConversationEvent(req.body||{}));
+    res.json({ok:true,conversation});
+  }catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.post("/api/bridge/lead",rateLimit("lead",60,60000),requireActiveClient,async(req,res)=>{
+  try{
+    const lead=await enqueueBridgeMutation(()=>{
+      const s=readStore();
+      const conversationId=req.body.conversationId||req.body.leadId;
+      const c=conversationId?s.conversations[conversationId]:null;
+      const body={...req.body,conversationId,fields:normaliseFields(req.body.fields||c?.fields||{}),messages:Array.isArray(req.body.messages)?req.body.messages:(c?.messages||[]),utm:req.body.utm||c?.utm||{}};
+      return saveLeadInternal(body);
+    });
+    res.status(201).json({ok:true,lead});
+  }catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+// Authenticated dashboard read endpoint for the Conversations page. This is
+// deliberately separate from /api/state so the page can refresh conversation
+// data without reloading every SEO/GA4/CRM payload.
+app.get("/api/conversations",requireAuth,(req,res)=>{
+  try{
+    const s=ensureStoreShape(readStore());
+    const clientId=selectedClient(req,s);
+    if(req.session.user.role!=="admin" && req.session.user.clientId!==clientId){
+      return res.status(403).json({error:"Workspace access denied"});
+    }
+    const conversations=Object.values(s.conversations||{})
+      .filter(x=>x && x.clientId===clientId)
+      .sort((a,b)=>new Date(b.updatedAt||0)-new Date(a.updatedAt||0));
+    res.json({ok:true,clientId,conversations});
+  }catch(e){res.status(500).json({error:e.message});}
+});
 
 
 // ---------- Unified Lead Source Hub (v8) ----------
