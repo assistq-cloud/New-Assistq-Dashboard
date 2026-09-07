@@ -17,28 +17,6 @@ const app=express();
 app.set("trust proxy",1);
 const PORT=Number(process.env.PORT||8787);
 
-/* ASSISTQ cross-origin browser API handling.
-   Client chatbots can live on GitHub Pages or another domain.
-   This middleware intentionally runs before rate limits, redirects and routes
-   so OPTIONS preflight requests always receive the required headers. */
-const PUBLIC_CORS_PATHS = new Set([
-  "/api/chatbot",
-  "/api/public/client-config",
-  "/api/bridge/conversation",
-  "/api/bridge/lead"
-]);
-app.use((req,res,next)=>{
-  if(!PUBLIC_CORS_PATHS.has(req.path)) return next();
-  const origin=req.headers.origin;
-  res.setHeader("Access-Control-Allow-Origin", origin || "*");
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, X-AssistQ-Secret");
-  res.setHeader("Access-Control-Max-Age", "86400");
-  if(req.method==="OPTIONS") return res.status(204).end();
-  next();
-});
-
 const defaultStore={
   settings:{businessName:"Demo Realty Group",clientId:"demo-realty",website:"https://example-realty.in",reportEmail:"",clientWhatsApp:"",whatsappCountryCode:"91",reportEnabled:false,hotThreshold:80,warmThreshold:50,assistant:{name:"ASSISTQ Assistant",greeting:"Hi! 👋 What can I help you with today?",tone:"Professional, friendly and concise",knowledge:"",questions:[]},customLeadFields:[],scoring:{name:10,phone:15,email:5,location:{default:6,matchPoints:10,serviceAreas:["Navi Mumbai","Mumbai","Thane","Pune"]},engagement:5,purpose:{default:5,values:{"Buying":10,"Renting":6}},configuration:{default:9,values:{"1BHK":9,"2BHK":12,"3BHK":14,"4BHK":15}},budget:{default:9,values:{"Under ₹50L":9,"₹50L-1Cr":11,"₹1Cr-2Cr":13,"₹2Cr+":15}},timeline:{default:8,values:{"Immediately":15,"1-3 months":11,"3-6 months":8,"Just exploring":4}}}},
   clients:[{id:"demo-realty",name:"Demo Realty Group",website:"https://example-realty.in",reportEmail:"",accessCode:"ASSISTQ-DEMO",plan:"Demo",subscriptionStatus:"active",subscriptionStart:null,subscriptionEnd:null,landingPageFile:null}],
@@ -196,6 +174,16 @@ app.use((req,res,next)=>{
   next();
 });
 
+// Public chatbot bridge, and the public checkout page (payment.html lives on
+// a different domain — www.assistq.in — than this API, so without this it
+// gets silently blocked by the browser before the request even arrives here).
+app.use((req,res,next)=>{
+  if(req.path.startsWith("/api/bridge")||req.path==="/api/leads"||req.path==="/api/public/client-config"||req.path==="/api/billing/create-subscription"||req.path==="/api/billing/verify"){
+    const origin=req.headers.origin;res.setHeader("Access-Control-Allow-Origin",origin||"*");res.setHeader("Vary","Origin");res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");res.setHeader("Access-Control-Allow-Headers","Content-Type, X-AssistQ-Secret");
+    if(req.method==="OPTIONS")return res.sendStatus(204);
+  }
+  next();
+});
 app.use(express.static(path.join(__dirname,"public")));
 
 function normaliseClientId(id){return String(id||"demo-realty").toLowerCase().replace(/[^a-z0-9_-]/g,"-").slice(0,60)||"demo-realty";}
@@ -204,7 +192,7 @@ function normaliseLandingPageFile(file){
   if(!value||value.includes("..")||value.startsWith("/")||!/^[-a-zA-Z0-9_./]+\.html$/i.test(value))return "";
   const base=path.basename(value);
   if(base.toLowerCase()!==value.toLowerCase())return "";
-  const reserved=new Set(["index.html","widget.html"]);
+  const reserved=new Set(["index.html","chatbot.html","widget.html"]);
   if(reserved.has(base.toLowerCase()))return "";
   const publicDir=path.join(__dirname,"public");
   const target=path.resolve(publicDir,base);
@@ -215,7 +203,7 @@ function availableLandingPages(){
   const publicDir=path.join(__dirname,"public");
   try{
     return fs.readdirSync(publicDir,{withFileTypes:true})
-      .filter(e=>e.isFile()&&/\.html$/i.test(e.name)&&!new Set(["index.html","widget.html"]).has(e.name.toLowerCase()))
+      .filter(e=>e.isFile()&&/\.html$/i.test(e.name)&&!new Set(["index.html","chatbot.html","widget.html"]).has(e.name.toLowerCase()))
       .map(e=>e.name)
       .sort((a,b)=>a.localeCompare(b));
   }catch{return [];}
@@ -773,6 +761,49 @@ app.post("/api/clients/:id/integrations",requireAdmin,(req,res)=>{
   res.json({ok:true,client:{...c,appsScriptWebhookUrl:undefined,webhookSecret:undefined},appsScriptConfigured:!!webhook,spreadsheetConfigured:!!c.googleSpreadsheetId});
 });
 
+app.delete("/api/clients/:id",requireAdmin,(req,res)=>{
+  try{
+    const s=ensureStoreShape(readStore());
+    const id=normaliseClientId(req.params.id);
+    const idx=s.clients.findIndex(x=>x.id===id);
+    if(idx<0)return res.status(404).json({error:"Client not found"});
+    if(s.clients.length<=1)return res.status(400).json({error:"You cannot remove the last client workspace."});
+
+    // Remove every client-scoped record so a deleted workspace cannot leak
+    // into another client's dashboard later. Shared/default settings remain.
+    s.clients.splice(idx,1);
+    delete s.clientProfiles[id];
+    delete s.gsc.byClient[id];
+    delete s.ga4.byClient[id];
+    delete s.google.byClient[id];
+    delete s.seoAudits[id];
+    delete s.integrationsByClient[id];
+    delete s.integrationsByClientMeta[id];
+    if(s.realEstate?.automationByClient)delete s.realEstate.automationByClient[id];
+    if(s.realEstate?.roundRobin)delete s.realEstate.roundRobin[id];
+    s.keywords=s.keywords.filter(x=>x.clientId!==id);
+    s.leads=s.leads.filter(x=>x.clientId!==id);
+    s.reportHistory=s.reportHistory.filter(x=>x.clientId!==id);
+    for(const key of Object.keys(s.conversations||{})){
+      if(s.conversations[key]?.clientId===id)delete s.conversations[key];
+    }
+    for(const key of Object.keys(s.utm||{})){
+      if(String(key).startsWith(id+"|"))delete s.utm[key];
+    }
+    for(const key of Object.keys(s.whatsappThreads||{})){
+      if(s.whatsappThreads[key]?.clientId===id)delete s.whatsappThreads[key];
+    }
+    for(const name of ["projects","team","visits","followups","activities","inventory","channelPartners","adSpend","documents","commissions","possession","testimonials"]){
+      if(Array.isArray(s.realEstate?.[name]))s.realEstate[name]=s.realEstate[name].filter(x=>x.clientId!==id);
+    }
+    writeStore(s);
+    res.json({ok:true,deletedClientId:id});
+  }catch(e){
+    console.error("ASSISTQ client removal:",e);
+    res.status(500).json({error:"Could not remove client: "+e.message});
+  }
+});
+
 app.post("/api/clients/:id/landing-page",requireAdmin,(req,res)=>{
   const s=ensureStoreShape(readStore());
   const id=normaliseClientId(req.params.id);
@@ -879,23 +910,16 @@ app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,as
   const clientId=normaliseClientId(req.body.clientId||req.assistqClientId);
   const client=s.clients.find(c=>c.id===clientId);
   if(!client)return res.status(404).json({status:"error",message:"Client not found"});
-  const upstream=String(client.appsScriptWebhookUrl||"").trim().replace(/[?#].*$/,"").replace(/\/$/,"");
+  const upstream=String(client.appsScriptWebhookUrl||"").trim();
   if(!upstream)return res.status(503).json({status:"error",message:`No Google Apps Script webhook is configured for ${client.name||clientId}. Ask an AssistQ admin to configure this client.`});
-  let webhookUrl;
-  try { webhookUrl=new URL(upstream); } catch { webhookUrl=null; }
-  const validAppsScriptWebhook = !!webhookUrl
-    && webhookUrl.protocol === "https:"
-    && webhookUrl.hostname.toLowerCase() === "script.google.com"
-    && /^\/macros\/s\/\S+\/exec$/i.test(webhookUrl.pathname);
-  if(!validAppsScriptWebhook)return res.status(500).json({status:"error",message:"This client's Google Apps Script webhook must be the deployed Google Apps Script /exec URL, for example https://script.google.com/macros/s/DEPLOYMENT_ID/exec"});
-  const upstreamUrl=webhookUrl.toString();
+  if(!/^https:\/\/script\.google\.com\/macros\/s\//i.test(upstream))return res.status(500).json({status:"error",message:"This client's Google Apps Script webhook must be a deployed /exec URL."});
   const forwarded={...req.body,clientId,googleSpreadsheetId:String(client.googleSpreadsheetId||""),businessName:String(client.name||""),reportEmail:String(client.reportEmail||""),clientWhatsApp:String(client.clientWhatsApp||""),webhookSecret:String(client.webhookSecret||""),assistant:client.assistant||s.clientProfiles?.[clientId]?.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||s.clientProfiles?.[clientId]?.customLeadFields||[],scoring:client.scoring||defaultScoring,hotThreshold:Number(client.hotThreshold??80),warmThreshold:Number(client.warmThreshold??50)};
   try{
     const controller=new AbortController();
     const timer=setTimeout(()=>controller.abort(),25000);
     let r;
     try{
-      r=await fetch(upstreamUrl,{
+      r=await fetch(upstream,{
         method:"POST",
         redirect:"follow",
         signal:controller.signal,
@@ -1476,17 +1500,6 @@ setInterval(async()=>{
     }
   }catch(e){console.error("ASSISTQ SEO audit scheduler",e.message);}
 },6*60*60*1000);
-
-// Final API error boundary: never let an unexpected server exception turn into an HTML 500 page.
-// Browser chatbots always receive JSON, which prevents "Server returned HTTP 500 instead of JSON" errors.
-app.use((err,req,res,next)=>{
-  console.error("ASSISTQ unhandled request error:",err?.stack||err?.message||err);
-  if(req.path.startsWith("/api/")||req.path.startsWith("/auth/")){
-    if(res.headersSent)return next(err);
-    return res.status(500).json({status:"error",error:"Internal server error",message:"AssistQ could not complete this request. Check the Railway server logs for the underlying error."});
-  }
-  next(err);
-});
 
 app.use((req,res,next)=>{if(req.method!=="GET")return next();if(req.path.startsWith("/api/")||req.path.startsWith("/auth/"))return res.status(404).end();res.sendFile(path.join(__dirname,"public","index.html"));});
 
