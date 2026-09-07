@@ -17,6 +17,9 @@ const app=express();
 app.set("trust proxy",1);
 const PORT=Number(process.env.PORT||8787);
 
+const ASSISTQ_WEBSITE_CLIENT_ID = String(process.env.ASSISTQ_WEBSITE_CLIENT_ID || "assistq-site").toLowerCase();
+const ASSISTQ_WEBSITE_WEBHOOK = String(process.env.ASSISTQ_WEBSITE_APPS_SCRIPT_WEBHOOK || "https://script.google.com/macros/s/AKfycbyZddoCVD7M1bnjFzmaP_6c_JdLr6T02z-PB_KC82-G1UQDSrVr08JpTo-StU37iGBT/exec").trim();
+const ASSISTQ_WEBSITE_EMAIL = String(process.env.ASSISTQ_WEBSITE_EMAIL || "assistq1@gmail.com").trim();
 const defaultStore={
   settings:{businessName:"Demo Realty Group",clientId:"demo-realty",website:"https://example-realty.in",reportEmail:"",clientWhatsApp:"",whatsappCountryCode:"91",reportEnabled:false,hotThreshold:80,warmThreshold:50,assistant:{name:"ASSISTQ Assistant",greeting:"Hi! 👋 What can I help you with today?",tone:"Professional, friendly and concise",knowledge:"",questions:[]},customLeadFields:[],scoring:{name:10,phone:15,email:5,location:{default:6,matchPoints:10,serviceAreas:["Navi Mumbai","Mumbai","Thane","Pune"]},engagement:5,purpose:{default:5,values:{"Buying":10,"Renting":6}},configuration:{default:9,values:{"1BHK":9,"2BHK":12,"3BHK":14,"4BHK":15}},budget:{default:9,values:{"Under ₹50L":9,"₹50L-1Cr":11,"₹1Cr-2Cr":13,"₹2Cr+":15}},timeline:{default:8,values:{"Immediately":15,"1-3 months":11,"3-6 months":8,"Just exploring":4}}}},
   clients:[{id:"demo-realty",name:"Demo Realty Group",website:"https://example-realty.in",reportEmail:"",accessCode:"ASSISTQ-DEMO",plan:"Demo",subscriptionStatus:"active",subscriptionStart:null,subscriptionEnd:null,landingPageFile:null}],
@@ -55,7 +58,14 @@ function ensureStoreShape(s){
   // client that doesn't have its own config yet — never edit it directly.
   s.realEstate.automationByClient=s.realEstate.automationByClient||{};
   s.realEstate.roundRobin=s.realEstate.roundRobin||{};
- s.clients=s.clients||defaultStore.clients; s.clientProfiles=s.clientProfiles||{}; s.keywords=s.keywords||[]; s.leads=s.leads||[]; s.conversations=s.conversations||{}; s.utm=s.utm||{}; s.gsc=s.gsc||defaultStore.gsc; s.gsc.byClient=s.gsc.byClient||{}; s.ga4=s.ga4||defaultStore.ga4; s.ga4.byClient=s.ga4.byClient||{}; s.google=s.google||defaultStore.google; s.google.byClient=s.google.byClient||{}; s.seoAudits=s.seoAudits||{}; s.reportHistory=s.reportHistory||[]; s.security=s.security||{adminPasswordHash:null}; s.whatsappThreads=s.whatsappThreads||{}; s.integrationsByClient=s.integrationsByClient||{}; s.integrationsByClientMeta=s.integrationsByClientMeta||{};
+ s.clients=s.clients||defaultStore.clients; s.clientProfiles=s.clientProfiles||{};
+  // Internal AssistQ website client: powers the public website chatbot without consuming a paid-client Foundation slot.
+  if(!s.clients.some(c=>String(c.id||"").toLowerCase()===ASSISTQ_WEBSITE_CLIENT_ID)){
+    s.clients.push({id:ASSISTQ_WEBSITE_CLIENT_ID,name:"AssistQ",website:"https://www.assistq.in",reportEmail:ASSISTQ_WEBSITE_EMAIL,clientWhatsApp:"918446242738",accessCode:"",plan:"Growth",subscriptionStatus:"active",subscriptionStart:null,subscriptionEnd:null,landingPageFile:null,appsScriptWebhookUrl:ASSISTQ_WEBSITE_WEBHOOK,internal:true});
+  } else {
+    const wc=s.clients.find(c=>String(c.id||"").toLowerCase()===ASSISTQ_WEBSITE_CLIENT_ID);
+    wc.internal=true; wc.appsScriptWebhookUrl=wc.appsScriptWebhookUrl||ASSISTQ_WEBSITE_WEBHOOK; wc.name=wc.name||"AssistQ"; wc.reportEmail=wc.reportEmail||ASSISTQ_WEBSITE_EMAIL; wc.website=wc.website||"https://www.assistq.in";
+  } s.keywords=s.keywords||[]; s.leads=s.leads||[]; s.conversations=s.conversations||{}; s.utm=s.utm||{}; s.gsc=s.gsc||defaultStore.gsc; s.gsc.byClient=s.gsc.byClient||{}; s.ga4=s.ga4||defaultStore.ga4; s.ga4.byClient=s.ga4.byClient||{}; s.google=s.google||defaultStore.google; s.google.byClient=s.google.byClient||{}; s.seoAudits=s.seoAudits||{}; s.reportHistory=s.reportHistory||[]; s.security=s.security||{adminPasswordHash:null}; s.whatsappThreads=s.whatsappThreads||{}; s.integrationsByClient=s.integrationsByClient||{}; s.integrationsByClientMeta=s.integrationsByClientMeta||{};
   s.clients=s.clients.map(c=>({...c,accessCode:c.accessCode||crypto.randomBytes(4).toString("hex").toUpperCase(),plan:c.plan||"Starter",subscriptionStatus:c.subscriptionStatus||"active",subscriptionStart:c.subscriptionStart||null,subscriptionEnd:c.subscriptionEnd||null,landingPageFile:normaliseLandingPageFile(c.landingPageFile)||null,appsScriptWebhookUrl:String(c.appsScriptWebhookUrl||"").trim(),googleSpreadsheetId:String(c.googleSpreadsheetId||"").trim(),webhookSecret:String(c.webhookSecret||"").trim()}));
   s.leads=s.leads.map(l=>({...l,pipelineStage:l.pipelineStage||"NEW",assignedTo:l.assignedTo||null,notes:l.notes||"",responseMinutes:l.responseMinutes??null,updatedAt:l.updatedAt||l.date||new Date().toISOString()}));
   return s;
@@ -495,7 +505,7 @@ function foundationOfferStatus(s, planKey) {
   const plan = PLAN_CATALOG[planKey];
   if (!plan) return { active: false, remaining: 0, discountedSetup: null };
   const label = plan.label.toLowerCase();
-  const existing = (s.clients || []).filter(c => String(c.plan || "Starter").toLowerCase().trim() === label).length;
+  const existing = (s.clients || []).filter(c => !c.internal && String(c.plan || "Starter").toLowerCase().trim() === label).length;
   const remaining = Math.max(0, FOUNDATION_OFFER.maxClients - existing);
   const discountedSetup = Math.round(plan.setup * (1 - FOUNDATION_OFFER.discountPercent / 100));
   return { active: remaining > 0, remaining, discountedSetup, normalSetup: plan.setup, maxClients: FOUNDATION_OFFER.maxClients };
