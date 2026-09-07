@@ -188,7 +188,14 @@ app.use((req,res,next)=>{
 // a different domain — www.assistq.in — than this API, so without this it
 // gets silently blocked by the browser before the request even arrives here).
 app.use((req,res,next)=>{
-  if(req.path.startsWith("/api/bridge")||req.path==="/api/leads"||req.path==="/api/public/client-config"||req.path==="/api/billing/create-subscription"||req.path==="/api/billing/verify"){
+  if(
+  req.path.startsWith("/api/bridge") ||
+  req.path === "/api/leads" ||
+  req.path === "/api/chatbot" ||
+  req.path === "/api/public/client-config" ||
+  req.path === "/api/billing/create-subscription" ||
+  req.path === "/api/billing/verify"
+){
     const origin=req.headers.origin;res.setHeader("Access-Control-Allow-Origin",origin||"*");res.setHeader("Vary","Origin");res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");res.setHeader("Access-Control-Allow-Headers","Content-Type, X-AssistQ-Secret");
     if(req.method==="OPTIONS")return res.sendStatus(204);
   }
