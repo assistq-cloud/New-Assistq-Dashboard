@@ -17,6 +17,28 @@ const app=express();
 app.set("trust proxy",1);
 const PORT=Number(process.env.PORT||8787);
 
+/* ASSISTQ cross-origin browser API handling.
+   Client chatbots can live on GitHub Pages or another domain.
+   This middleware intentionally runs before rate limits, redirects and routes
+   so OPTIONS preflight requests always receive the required headers. */
+const PUBLIC_CORS_PATHS = new Set([
+  "/api/chatbot",
+  "/api/public/client-config",
+  "/api/bridge/conversation",
+  "/api/bridge/lead"
+]);
+app.use((req,res,next)=>{
+  if(!PUBLIC_CORS_PATHS.has(req.path)) return next();
+  const origin=req.headers.origin;
+  res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, X-AssistQ-Secret");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  if(req.method==="OPTIONS") return res.status(204).end();
+  next();
+});
+
 const defaultStore={
   settings:{businessName:"Demo Realty Group",clientId:"demo-realty",website:"https://example-realty.in",reportEmail:"",clientWhatsApp:"",whatsappCountryCode:"91",reportEnabled:false,hotThreshold:80,warmThreshold:50,assistant:{name:"ASSISTQ Assistant",greeting:"Hi! 👋 What can I help you with today?",tone:"Professional, friendly and concise",knowledge:"",questions:[]},customLeadFields:[],scoring:{name:10,phone:15,email:5,location:{default:6,matchPoints:10,serviceAreas:["Navi Mumbai","Mumbai","Thane","Pune"]},engagement:5,purpose:{default:5,values:{"Buying":10,"Renting":6}},configuration:{default:9,values:{"1BHK":9,"2BHK":12,"3BHK":14,"4BHK":15}},budget:{default:9,values:{"Under ₹50L":9,"₹50L-1Cr":11,"₹1Cr-2Cr":13,"₹2Cr+":15}},timeline:{default:8,values:{"Immediately":15,"1-3 months":11,"3-6 months":8,"Just exploring":4}}}},
   clients:[{id:"demo-realty",name:"Demo Realty Group",website:"https://example-realty.in",reportEmail:"",accessCode:"ASSISTQ-DEMO",plan:"Demo",subscriptionStatus:"active",subscriptionStart:null,subscriptionEnd:null,landingPageFile:null}],
@@ -174,42 +196,6 @@ app.use((req,res,next)=>{
   next();
 });
 
-// Public browser APIs need CORS because client websites (including GitHub
-// Pages) are hosted on a different origin from https://app.assistq.in.
-// IMPORTANT: /api/chatbot is included here. Without it, a browser-hosted
-// chatbot sends a JSON POST, triggers an OPTIONS preflight, receives no CORS
-// response, and fetch() reports only "Failed to fetch".
-app.use((req,res,next)=>{
-  const isPublicBrowserApi =
-    req.path.startsWith("/api/bridge") ||
-    req.path === "/api/chatbot" ||
-    req.path === "/api/leads" ||
-    req.path === "/api/public/client-config" ||
-    req.path === "/api/billing/create-subscription" ||
-    req.path === "/api/billing/verify";
-
-  if(isPublicBrowserApi){
-    const origin=req.headers.origin;
-
-    // These endpoints are intentionally public browser endpoints. Reflect the
-    // requesting origin rather than using a fixed origin because each AssistQ
-    // client can host the chatbot on a different website/domain.
-    res.setHeader("Access-Control-Allow-Origin", origin || "*");
-    res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Accept, Authorization, X-AssistQ-Secret"
-    );
-    res.setHeader("Access-Control-Max-Age", "600");
-
-    // Browser preflight must terminate successfully before Express reaches
-    // the POST route. This is the key fix for GitHub Pages/client websites.
-    if(req.method === "OPTIONS") return res.sendStatus(204);
-  }
-
-  next();
-});
 app.use(express.static(path.join(__dirname,"public")));
 
 function normaliseClientId(id){return String(id||"demo-realty").toLowerCase().replace(/[^a-z0-9_-]/g,"-").slice(0,60)||"demo-realty";}
