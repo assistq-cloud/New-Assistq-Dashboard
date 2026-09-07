@@ -248,6 +248,28 @@ function planHasFeature(plan, feature) {
   return false; // starter
 }
 // ---------- Authentication / client-scope middleware ----------
+// CSRF protection — the frontend (public/app.js) already sends whatever
+// token /api/auth/status or /api/auth/login gives it back as an
+// X-CSRF-Token header on every follow-up request. These two functions were
+// referenced throughout the file but never actually defined, which is what
+// crashed every request with "csrfToken is not defined" / "requireCsrf is
+// not defined" — this fills in that missing half.
+function csrfToken(req) {
+  if (!req.session.csrfToken) req.session.csrfToken = crypto.randomBytes(24).toString("hex");
+  return req.session.csrfToken;
+}
+function requireCsrf(req, res, next) {
+  // Reads (GET/HEAD/OPTIONS) can't cause a state change, so they're exempt.
+  // Requests with no logged-in session yet (public checkout, portal
+  // webhooks, Razorpay webhooks) have no session token to forge in the
+  // first place, so they're exempt too — this only guards authenticated,
+  // state-changing dashboard actions.
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  if (!req.session?.user) return next();
+  const sent = req.headers["x-csrf-token"];
+  if (!sent || sent !== req.session.csrfToken) return res.status(403).json({ error: "Invalid or missing CSRF token — please refresh the page and try again." });
+  next();
+}
 function requireAuth(req,res,next){
   if(!req.session?.user) return res.status(401).json({error:"Authentication required"});
   next();
