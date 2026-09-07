@@ -406,14 +406,14 @@
 <script>
 // ============ CONTENT — edit this per client's business ============
 const CONTENT = {
-  title: "ABC COMPANY",
+  title: "Horizon Realty",
   tagline: "Helping families and investors find the right property across Mumbai, Thane, and Pune — without the pressure.",
 
   // Optional — paste a real photo URL here (property, storefront, team).
   // Leave as "" for no image; falls back safely either way.
   heroImage: "",
 
-  about: "Horizon Realty has been helping buyers, renters, and investors navigate the Mumbai and Pune property markets for over a decade. We work with a curated set of verified listings, handle the paperwork end-to-end, and stay with you from the first shortlist to the final handover — no pressure, no hidden fees, just honest guidance.",
+  about: "ABC Company has been helping buyers, renters, and investors navigate the Mumbai and Pune property markets for over a decade. We work with a curated set of verified listings, handle the paperwork end-to-end, and stay with you from the first shortlist to the final handover — no pressure, no hidden fees, just honest guidance.",
 
   services: [
     { icon: "🏠", title: "Buy a Home", desc: "Verified listings across budgets, from compact apartments to family villas." },
@@ -743,13 +743,22 @@ async function bridgeEvent(role, content) {
 }
 
 async function bridgeLead() {
-  if (!CONFIG.dashboardUrl || CONFIG.dashboardUrl.includes("PASTE_")) return;
+  if (!CONFIG.dashboardUrl || CONFIG.dashboardUrl.includes("PASTE_")) {
+    return { ok: false, skipped: true, error: "Dashboard URL is not configured" };
+  }
   try {
-    await fetch(CONFIG.dashboardUrl + "/api/bridge/lead", {
+    const res = await fetch(CONFIG.dashboardUrl + "/api/bridge/lead", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      mode: "cors",
+      credentials: "omit",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
       body: JSON.stringify({
         conversationId: leadId,
+        leadId,
         fields: knownFields,
         messages: conversation,
         utm,
@@ -758,8 +767,20 @@ async function bridgeLead() {
       }),
       keepalive: true
     });
+
+    const raw = await res.text();
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+    if (!res.ok) {
+      console.warn("[ASSISTQ] Dashboard lead bridge failed:", res.status, raw);
+      return { ok: false, status: res.status, error: data?.error || data?.message || raw.slice(0, 300) };
+    }
+
+    return { ok: true, data };
   } catch (e) {
-    console.debug("ASSISTQ dashboard lead bridge unavailable", e);
+    console.warn("[ASSISTQ] Dashboard lead bridge unavailable:", e);
+    return { ok: false, error: e?.message || "Network error" };
   }
 }
 
@@ -780,6 +801,8 @@ async function sendMessage(optionText) {
     bridgeEvent("user", text);
     textInput.value = "";
     awaitingLocalField = null;
+    // Persist newly captured contact information immediately.
+    await bridgeLead();
     const missing = ["name", "phone", "email"].find(k => !String(knownFields[k] || "").trim());
     if (missing) {
       awaitingLocalField = missing;
@@ -801,6 +824,10 @@ async function sendMessage(optionText) {
   addMessage("user", text);
   conversation.push({ role: "user", content: text });
   bridgeEvent("user", text);
+  // Keep the dashboard lead record live while the visitor is chatting.
+  // The same leadId is reused, so the server updates one lead instead of
+  // creating a new lead for every message.
+  void bridgeLead();
   textInput.value = "";
   sendBtn.disabled = true;
 
@@ -812,7 +839,6 @@ async function sendMessage(optionText) {
       mode: "cors",
       credentials: "omit",
       cache: "no-store",
-      mode: "cors",
       headers: {
         "Content-Type": "application/json",
         "Accept": "application/json"
@@ -910,7 +936,6 @@ async function submitLead() {
       mode: "cors",
       credentials: "omit",
       cache: "no-store",
-      mode: "cors",
       headers: {
         "Content-Type": "application/json",
         "Accept": "application/json"
