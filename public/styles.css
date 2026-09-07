@@ -39,6 +39,21 @@ nav::-webkit-scrollbar-thumb{background:var(--cardBorder);border-radius:10px}
 .nav:hover{background:rgba(255,255,255,0.04);color:var(--text)}
 .nav.active{background:var(--asoft);color:var(--a2)}
 .sidebar-foot{margin-top:auto;padding:14px 11px 4px;font-size:10px;color:var(--muted);font-family:var(--mono)}
+.nav-search{width:100%;margin:0 0 12px;padding:9px 12px;background:rgba(255,255,255,0.03);border:1px solid var(--cardBorder);border-radius:10px;color:var(--text);font-size:12px}
+.nav-search::placeholder{color:var(--muted)}
+.nav-search:focus{outline:none;border-color:var(--a)}
+.nav-group{display:flex;flex-direction:column;gap:2px}
+.nav-group-label{font-size:9.5px;letter-spacing:1.1px;text-transform:uppercase;color:var(--muted);font-family:var(--mono);padding:14px 12px 6px;opacity:.75}
+.nav-group-label:first-of-type{padding-top:4px}
+/* ---- Per-page "how to use this" tip card (dismissible) ---- */
+.tipcard{background:linear-gradient(135deg,rgba(203,164,104,0.10),rgba(203,164,104,0.04));border:1px solid rgba(203,164,104,0.28);border-radius:16px;padding:16px 18px;margin:-8px 0 22px;position:relative}
+.tipcard-head{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+.tipcard-head b{font-family:var(--serif);font-size:13.5px;color:var(--a2);font-weight:600}
+.tipcard-icon{font-size:14px}
+.tipcard-close{margin-left:auto;background:transparent;border:0;color:var(--muted);cursor:pointer;font-size:12px;width:22px;height:22px;border-radius:6px}
+.tipcard-close:hover{color:var(--a2);background:rgba(255,255,255,0.06)}
+.tipcard ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px}
+.tipcard li{font-size:12px;line-height:1.55;color:var(--text)}
 .live{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:6px;box-shadow:0 0 6px var(--green)}
 
 .main{margin-left:252px;min-height:100vh;position:relative}
