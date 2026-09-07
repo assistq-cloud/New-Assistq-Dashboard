@@ -10,7 +10,24 @@ async function api(url,opt={}){
 }
 function clientId(){return localStorage.getItem("assistqClientId")||"demo-realty"}
 async function auth(){const a=await api("/api/auth/status");S.csrfToken=a.csrfToken||S.csrfToken;if(!a.authenticated){$("#login").classList.remove("hidden");$("#app").classList.add("hidden");return false;}S.user=a.user;$("#login").classList.add("hidden");$("#app").classList.remove("hidden");return true}
-async function load(){if(!(await auth()))return;try{S.data=await api(`/api/state?clientId=${encodeURIComponent(clientId())}`);renderTop();render();}catch(e){if(e.message.includes("Authentication"))return auth();toast(e.message)}}
+async function load(){if(!(await auth()))return;try{S.data=await api(`/api/state?clientId=${encodeURIComponent(clientId())}`);renderTop();await loadConversations();render();}catch(e){if(e.message.includes("Authentication"))return auth();toast(e.message)}}
+async function loadConversations(){
+  if(!S.data)return;
+  try{
+    const r=await api(`/api/conversations?clientId=${encodeURIComponent(S.data.clientId)}`);
+    if(Array.isArray(r.conversations)) S.data.conversations=Object.fromEntries(r.conversations.map(c=>[c.id,c]));
+  }catch(e){console.debug("Conversation refresh unavailable",e.message);}
+}
+let conversationRefreshTimer=null;
+function startConversationRefresh(){
+  if(conversationRefreshTimer)clearInterval(conversationRefreshTimer);
+  conversationRefreshTimer=setInterval(async()=>{
+    if(document.hidden||!S.data||S.page!=="conversations")return;
+    await loadConversations();
+    render();
+  },3000);
+}
+startConversationRefresh();
 function renderTop(){const sub=S.data.settings?.subscription||{};$("#subscriptionState").textContent=`Subscription: ${String(sub.status||"unknown").toUpperCase()}${sub.plan?" · "+sub.plan:""}`;$("#subscriptionState").className=`status sub-status ${sub.status||""}`;$("#googleState").textContent=S.data.googleConnected?`Google: ${S.data.googleEmail||"connected"}`:"Google: not connected";const sel=$("#clientSelect");sel.innerHTML=(S.data.clients||[]).map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");sel.value=S.data.clientId||clientId();sel.disabled=S.user?.role!=="admin";}
 function head(k,t,s,button=""){return `<div class="head"><div><div class="eyebrow">${k}</div><h1>${t}</h1><div class="sub">${s}</div></div>${button}</div>`}
 const PLAN_FEATURES={
@@ -359,7 +376,7 @@ Object.assign(pages,{whatsapp:whatsappPage});
 const _oldLoad=load;load=async function(){await _oldLoad();if(S.data){if(!S.data.re)await refreshReData();await refreshV2();render();}};
 document.addEventListener('click',e=>{const btn=e.target.closest('.pw-eye');if(!btn)return;const input=document.getElementById(btn.dataset.for);if(!input)return;const show=input.type==='password';input.type=show?'text':'password';btn.textContent=show?'🙈':'👁';btn.title=show?'Hide password':'Show password';btn.setAttribute('aria-label',btn.title)});
 $('#loginForm').addEventListener('submit',async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/auth/login',{method:'POST',body:JSON.stringify({email:$('#loginEmail').value,password:$('#loginPassword').value})});await load()}catch(err){$('#loginError').textContent=err.message}});
-$('#nav').onclick=e=>{const b=e.target.closest('[data-page]');if(b){S.page=b.dataset.page;S.selectedLead=S.selectedConversation=null;render()}};$('#clientSelect').onchange=e=>{localStorage.setItem('assistqClientId',e.target.value);S.selectedLead=S.selectedConversation=null;load()};$('#theme').onclick=()=>{document.body.classList.toggle('dark');S.dark=!S.dark};$('#refresh').onclick=load;$('#logout').onclick=async()=>{await api('/api/auth/logout',{method:'POST'});load()};load();
+$('#nav').onclick=async e=>{const b=e.target.closest('[data-page]');if(b){S.page=b.dataset.page;S.selectedLead=S.selectedConversation=null;if(S.page==='conversations')await loadConversations();render()}};$('#clientSelect').onchange=e=>{localStorage.setItem('assistqClientId',e.target.value);S.selectedLead=S.selectedConversation=null;load()};$('#theme').onclick=()=>{document.body.classList.toggle('dark');S.dark=!S.dark};$('#refresh').onclick=load;$('#logout').onclick=async()=>{await api('/api/auth/logout',{method:'POST'});load()};load();
 
 // ---------- AssistQ v8 Unified Lead Hub UI ----------
 async function loadIntegrations(){try{S.data.integrations=await api(`/api/integrations?clientId=${encodeURIComponent(S.data.clientId)}`);}catch(e){toast(e.message)}}
