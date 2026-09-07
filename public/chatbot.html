@@ -647,7 +647,7 @@ launcher.addEventListener("click", async () => {
     if (CONFIG.subscriptionActive === false) { addMessage("error", "This assistant is temporarily unavailable. Please contact the business."); return; }
     addMessage("bot", CONFIG.greeting);
     conversation.push({ role: "assistant", content: CONFIG.greeting });
-    bridgeEvent("assistant", CONFIG.greeting);
+    await bridgeEvent("assistant", CONFIG.greeting);
     showOptionsIfAny();
   }
 });
@@ -659,7 +659,7 @@ async function openChat() {
     if (CONFIG.subscriptionActive === false) { addMessage("error", "This assistant is temporarily unavailable. Please contact the business."); return; }
     addMessage("bot", CONFIG.greeting);
     conversation.push({ role: "assistant", content: CONFIG.greeting });
-    bridgeEvent("assistant", CONFIG.greeting);
+    await bridgeEvent("assistant", CONFIG.greeting);
     showOptionsIfAny();
   }
   panel.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -721,25 +721,40 @@ function showOptionsIfAny() {
 }
 
 async function bridgeEvent(role, content) {
-  if (!CONFIG.dashboardUrl || CONFIG.dashboardUrl.includes("PASTE_")) return;
-  try {
-    await fetch(CONFIG.dashboardUrl + "/api/bridge/conversation", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        leadId,
-        event: { role, content, at: new Date().toISOString() },
-        fields: knownFields,
-        utm,
-        clientId: CONFIG.clientId,
-        businessName: CONFIG.businessName
-      }),
-      keepalive: true
-    });
-  } catch (e) {
-    // The chatbot must keep working even when the local dashboard is offline.
-    console.debug("ASSISTQ dashboard bridge unavailable", e);
+  if (!CONFIG.dashboardUrl || CONFIG.dashboardUrl.includes("PASTE_")) {
+    return { ok:false, skipped:true };
   }
+  const payload={
+    leadId,
+    conversationId: leadId,
+    event: { role, content, at: new Date().toISOString() },
+    fields: knownFields,
+    utm,
+    clientId: CONFIG.clientId,
+    businessName: CONFIG.businessName
+  };
+  for(let attempt=1;attempt<=2;attempt++){
+    try {
+      const res=await fetch(CONFIG.dashboardUrl + "/api/bridge/conversation", {
+        method: "POST",
+        mode: "cors",
+        credentials: "omit",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json", "Accept":"application/json" },
+        body: JSON.stringify(payload),
+        keepalive: true
+      });
+      const raw=await res.text();
+      let data={};
+      try{data=raw?JSON.parse(raw):{};}catch(_){}
+      if(res.ok && data.ok!==false) return data;
+      if(attempt===2) console.warn("ASSISTQ conversation bridge rejected",res.status,data.error||data.message||raw);
+    } catch(e) {
+      if(attempt===2) console.debug("ASSISTQ dashboard bridge unavailable", e);
+    }
+    await new Promise(r=>setTimeout(r,250*attempt));
+  }
+  return {ok:false};
 }
 
 async function bridgeLead() {
@@ -798,10 +813,11 @@ async function sendMessage(optionText) {
     knownFields[field]=text;
     addMessage("user", text);
     conversation.push({ role: "user", content: text });
-    bridgeEvent("user", text);
+    await bridgeEvent("user", text);
     textInput.value = "";
     awaitingLocalField = null;
-    // Persist newly captured contact information immediately.
+    // Persist the message first, then snapshot the lead. The backend also
+    // serializes these mutations, so one cannot overwrite the other.
     await bridgeLead();
     const missing = ["name", "phone", "email"].find(k => !String(knownFields[k] || "").trim());
     if (missing) {
@@ -823,11 +839,11 @@ async function sendMessage(optionText) {
   optionsContainer.innerHTML = "";
   addMessage("user", text);
   conversation.push({ role: "user", content: text });
-  bridgeEvent("user", text);
+  await bridgeEvent("user", text);
   // Keep the dashboard lead record live while the visitor is chatting.
   // The same leadId is reused, so the server updates one lead instead of
   // creating a new lead for every message.
-  void bridgeLead();
+  await bridgeLead();
   textInput.value = "";
   sendBtn.disabled = true;
 
@@ -885,7 +901,7 @@ async function sendMessage(optionText) {
     addMessage("bot", safeReply);
     conversation.push({ role: "assistant", content: safeReply });
     knownFields = data.fields || knownFields;
-    bridgeEvent("assistant", safeReply);
+    await bridgeEvent("assistant", safeReply);
 
     if (data.complete && !isComplete) {
       const missing = ["name", "phone", "email"].find(k => !String(knownFields[k] || "").trim());
@@ -893,12 +909,12 @@ async function sendMessage(optionText) {
         awaitingLocalField = "email";
         addMessage("bot", "Before I save this enquiry, what is the best email address to reach you?");
         conversation.push({ role: "assistant", content: "Before I save this enquiry, what is the best email address to reach you?" });
-        bridgeEvent("assistant", "Before I save this enquiry, what is the best email address to reach you?");
+        await bridgeEvent("assistant", "Before I save this enquiry, what is the best email address to reach you?");
       } else if (missing) {
         awaitingLocalField = missing;
         addMessage("bot", `Before I save this enquiry, could you share your ${missing}?`);
         conversation.push({ role: "assistant", content: `Before I save this enquiry, could you share your ${missing}?` });
-        bridgeEvent("assistant", `Before I save this enquiry, could you share your ${missing}?`);
+        await bridgeEvent("assistant", `Before I save this enquiry, could you share your ${missing}?`);
       } else {
         isComplete = true;
         await submitLead();
