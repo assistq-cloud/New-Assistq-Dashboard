@@ -807,8 +807,20 @@ async function sendMessage(optionText) {
   try {
     const res = await fetch(CONFIG.webhookUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ action: "chat", leadId: leadId, messages: conversation, knownFields: knownFields, clientId: CONFIG.clientId, dashboardUrl: CONFIG.dashboardUrl, businessName: CONFIG.businessName })
+      mode: "cors",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify({
+        action: "chat",
+        leadId,
+        messages: conversation,
+        knownFields,
+        clientId: CONFIG.clientId,
+        dashboardUrl: CONFIG.dashboardUrl,
+        businessName: CONFIG.businessName
+      })
     });
 
     const rawText = await res.text();
@@ -858,7 +870,18 @@ async function sendMessage(optionText) {
 
   } catch (err) {
     typingEl.remove();
-    addMessage("error", "Request failed: " + err.message + " (check the AssistQ backend connection and your internet connection)");
+    console.error("ASSISTQ chat request failed:", err);
+
+    const isBrowserConnectionError =
+      err instanceof TypeError ||
+      /failed to fetch|networkerror|load failed/i.test(String(err?.message || ""));
+
+    addMessage(
+      "error",
+      isBrowserConnectionError
+        ? "Unable to connect to AssistQ. Please try again in a moment."
+        : "Request failed: " + (err?.message || "Unknown error")
+    );
   }
 
   sendBtn.disabled = false;
@@ -871,8 +894,19 @@ async function submitLead() {
   try {
     const res = await fetch(CONFIG.webhookUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ action: "submit", leadId: leadId, fields: knownFields, utm: utm, clientId: CONFIG.clientId, businessName: CONFIG.businessName })
+      mode: "cors",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify({
+        action: "submit",
+        leadId,
+        fields: knownFields,
+        utm,
+        clientId: CONFIG.clientId,
+        businessName: CONFIG.businessName
+      })
     });
     const rawText = await res.text();
     let data;
