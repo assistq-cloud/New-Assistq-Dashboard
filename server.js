@@ -879,16 +879,23 @@ app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,as
   const clientId=normaliseClientId(req.body.clientId||req.assistqClientId);
   const client=s.clients.find(c=>c.id===clientId);
   if(!client)return res.status(404).json({status:"error",message:"Client not found"});
-  const upstream=String(client.appsScriptWebhookUrl||"").trim().replace(/[?#].*$/,"");
+  const upstream=String(client.appsScriptWebhookUrl||"").trim().replace(/[?#].*$/,"").replace(/\/$/,"");
   if(!upstream)return res.status(503).json({status:"error",message:`No Google Apps Script webhook is configured for ${client.name||clientId}. Ask an AssistQ admin to configure this client.`});
-  if(!/^https:\/\/script\.google\.com\/macros\/s\/[^\\s/]+\/exec$/i.test(upstream))return res.status(500).json({status:"error",message:"This client's Google Apps Script webhook must be the deployed Google Apps Script /exec URL."});
+  let webhookUrl;
+  try { webhookUrl=new URL(upstream); } catch { webhookUrl=null; }
+  const validAppsScriptWebhook = !!webhookUrl
+    && webhookUrl.protocol === "https:"
+    && webhookUrl.hostname.toLowerCase() === "script.google.com"
+    && /^\/macros\/s/\S+\/exec$/i.test(webhookUrl.pathname);
+  if(!validAppsScriptWebhook)return res.status(500).json({status:"error",message:"This client's Google Apps Script webhook must be the deployed Google Apps Script /exec URL, for example https://script.google.com/macros/s/DEPLOYMENT_ID/exec"});
+  const upstreamUrl=webhookUrl.toString();
   const forwarded={...req.body,clientId,googleSpreadsheetId:String(client.googleSpreadsheetId||""),businessName:String(client.name||""),reportEmail:String(client.reportEmail||""),clientWhatsApp:String(client.clientWhatsApp||""),webhookSecret:String(client.webhookSecret||""),assistant:client.assistant||s.clientProfiles?.[clientId]?.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||s.clientProfiles?.[clientId]?.customLeadFields||[],scoring:client.scoring||defaultScoring,hotThreshold:Number(client.hotThreshold??80),warmThreshold:Number(client.warmThreshold??50)};
   try{
     const controller=new AbortController();
     const timer=setTimeout(()=>controller.abort(),25000);
     let r;
     try{
-      r=await fetch(upstream,{
+      r=await fetch(upstreamUrl,{
         method:"POST",
         redirect:"follow",
         signal:controller.signal,
