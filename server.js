@@ -886,7 +886,7 @@ app.post("/api/chatbot",rateLimit("chatbot-ai",120,60000),requireActiveClient,as
   const validAppsScriptWebhook = !!webhookUrl
     && webhookUrl.protocol === "https:"
     && webhookUrl.hostname.toLowerCase() === "script.google.com"
-    && /^\/macros\/s/\S+\/exec$/i.test(webhookUrl.pathname);
+    && /^\/macros\/s\/\S+\/exec$/i.test(webhookUrl.pathname);
   if(!validAppsScriptWebhook)return res.status(500).json({status:"error",message:"This client's Google Apps Script webhook must be the deployed Google Apps Script /exec URL, for example https://script.google.com/macros/s/DEPLOYMENT_ID/exec"});
   const upstreamUrl=webhookUrl.toString();
   const forwarded={...req.body,clientId,googleSpreadsheetId:String(client.googleSpreadsheetId||""),businessName:String(client.name||""),reportEmail:String(client.reportEmail||""),clientWhatsApp:String(client.clientWhatsApp||""),webhookSecret:String(client.webhookSecret||""),assistant:client.assistant||s.clientProfiles?.[clientId]?.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||s.clientProfiles?.[clientId]?.customLeadFields||[],scoring:client.scoring||defaultScoring,hotThreshold:Number(client.hotThreshold??80),warmThreshold:Number(client.warmThreshold??50)};
