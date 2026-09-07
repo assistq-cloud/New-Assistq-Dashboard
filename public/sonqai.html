@@ -406,7 +406,7 @@
 <script>
 // ============ CONTENT — edit this per client's business ============
 const CONTENT = {
-  title: "SONQAI TECHNOLOGIES",
+  title: "SonQAI",
   tagline: "Helping families and investors find the right property across Mumbai, Thane, and Pune — without the pressure.",
 
   // Optional — paste a real photo URL here (property, storefront, team).
@@ -563,9 +563,9 @@ const CONFIG = {
   // One Apps Script deployment can serve all clients. Prefer URL parameters
   // for per-client setup so this file does not need to be edited every time.
   webhookUrl: "",
-  dashboardUrl: window.ASSISTQ_DASHBOARD_URL || "https://app.assistq.in",
-  clientId: window.ASSISTQ_LANDING_CLIENT_ID || "sonqai-technologies",
-  businessName: "This Business",
+  dashboardUrl: "https://app.assistq.in",
+  clientId: "sonqai-technologies",
+  businessName: "SonQAI",
   greeting: "Hi! 👋 What's your name?",
 
   // Must be in the SAME ORDER as the backend's CONFIG.questions.
@@ -596,7 +596,9 @@ const clientFromUrl = params.get("clientId");
 const dashboardFromUrl = params.get("dashboardUrl");
 if (clientFromUrl) CONFIG.clientId = clientFromUrl;
 if (dashboardFromUrl) CONFIG.dashboardUrl = dashboardFromUrl.replace(/\/$/, "");
-if (!CONFIG.webhookUrl && CONFIG.dashboardUrl) CONFIG.webhookUrl = CONFIG.dashboardUrl + "/api/chatbot";
+if (!/^https:\/\//i.test(CONFIG.dashboardUrl)) CONFIG.dashboardUrl = "https://app.assistq.in";
+CONFIG.dashboardUrl = CONFIG.dashboardUrl.replace(/\/$/, "");
+CONFIG.webhookUrl = CONFIG.dashboardUrl + "/api/chatbot";
 
 // Capture UTM tracking params from the URL.
 // Normal links use: ?utm_source=instagram&utm_medium=paid&utm_campaign=summer_property
@@ -741,13 +743,22 @@ async function bridgeEvent(role, content) {
 }
 
 async function bridgeLead() {
-  if (!CONFIG.dashboardUrl || CONFIG.dashboardUrl.includes("PASTE_")) return;
+  if (!CONFIG.dashboardUrl || CONFIG.dashboardUrl.includes("PASTE_")) {
+    return { ok: false, skipped: true, error: "Dashboard URL is not configured" };
+  }
   try {
-    await fetch(CONFIG.dashboardUrl + "/api/bridge/lead", {
+    const res = await fetch(CONFIG.dashboardUrl + "/api/bridge/lead", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      mode: "cors",
+      credentials: "omit",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
       body: JSON.stringify({
         conversationId: leadId,
+        leadId,
         fields: knownFields,
         messages: conversation,
         utm,
@@ -756,8 +767,20 @@ async function bridgeLead() {
       }),
       keepalive: true
     });
+
+    const raw = await res.text();
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+    if (!res.ok) {
+      console.warn("[ASSISTQ] Dashboard lead bridge failed:", res.status, raw);
+      return { ok: false, status: res.status, error: data?.error || data?.message || raw.slice(0, 300) };
+    }
+
+    return { ok: true, data };
   } catch (e) {
-    console.debug("ASSISTQ dashboard lead bridge unavailable", e);
+    console.warn("[ASSISTQ] Dashboard lead bridge unavailable:", e);
+    return { ok: false, error: e?.message || "Network error" };
   }
 }
 
@@ -778,6 +801,8 @@ async function sendMessage(optionText) {
     bridgeEvent("user", text);
     textInput.value = "";
     awaitingLocalField = null;
+    // Persist newly captured contact information immediately.
+    await bridgeLead();
     const missing = ["name", "phone", "email"].find(k => !String(knownFields[k] || "").trim());
     if (missing) {
       awaitingLocalField = missing;
@@ -799,6 +824,10 @@ async function sendMessage(optionText) {
   addMessage("user", text);
   conversation.push({ role: "user", content: text });
   bridgeEvent("user", text);
+  // Keep the dashboard lead record live while the visitor is chatting.
+  // The same leadId is reused, so the server updates one lead instead of
+  // creating a new lead for every message.
+  void bridgeLead();
   textInput.value = "";
   sendBtn.disabled = true;
 
@@ -807,11 +836,33 @@ async function sendMessage(optionText) {
   try {
     const res = await fetch(CONFIG.webhookUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ action: "chat", leadId: leadId, messages: conversation, knownFields: knownFields, clientId: CONFIG.clientId, dashboardUrl: CONFIG.dashboardUrl, businessName: CONFIG.businessName })
+      mode: "cors",
+      credentials: "omit",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify({
+        action: "chat",
+        leadId,
+        messages: conversation,
+        knownFields,
+        clientId: CONFIG.clientId,
+        dashboardUrl: CONFIG.dashboardUrl,
+        businessName: CONFIG.businessName
+      })
     });
 
     const rawText = await res.text();
+    if (!res.ok) {
+      typingEl.remove();
+      let detail = rawText;
+      try { const errData = JSON.parse(rawText); detail = errData.message || errData.error || detail; } catch (_) {}
+      addMessage("error", `AssistQ backend HTTP ${res.status}: ${String(detail).slice(0, 300)}`);
+      sendBtn.disabled = false;
+      return;
+    }
     let data;
     try {
       data = JSON.parse(rawText);
@@ -858,7 +909,18 @@ async function sendMessage(optionText) {
 
   } catch (err) {
     typingEl.remove();
-    addMessage("error", "Request failed: " + err.message + " (check the AssistQ backend connection and your internet connection)");
+    console.error("ASSISTQ chat request failed:", err);
+
+    const isBrowserConnectionError =
+      err instanceof TypeError ||
+      /failed to fetch|networkerror|load failed/i.test(String(err?.message || ""));
+
+    addMessage(
+      "error",
+      isBrowserConnectionError
+        ? "Unable to connect to AssistQ. Please try again in a moment."
+        : "Request failed: " + (err?.message || "Unknown error")
+    );
   }
 
   sendBtn.disabled = false;
@@ -871,8 +933,21 @@ async function submitLead() {
   try {
     const res = await fetch(CONFIG.webhookUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ action: "submit", leadId: leadId, fields: knownFields, utm: utm, clientId: CONFIG.clientId, businessName: CONFIG.businessName })
+      mode: "cors",
+      credentials: "omit",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify({
+        action: "submit",
+        leadId,
+        fields: knownFields,
+        utm,
+        clientId: CONFIG.clientId,
+        businessName: CONFIG.businessName
+      })
     });
     const rawText = await res.text();
     let data;
@@ -944,7 +1019,7 @@ document.querySelectorAll(".statItem .num").forEach(el => {
 // this is here so YOU can open devtools on a client's page and
 // immediately see what's misconfigured instead of guessing). ----
 (function diagnostics() {
-  const warn = (msg) => console.warn("%cASSISTQ setup:", "color:#e2703a;font-weight:bold", msg);
+  const warn = (msg) => console.warn("%cASSISTQ setup:", "color:#e2703a;font-weight:bold", msg);\n  console.info("[ASSISTQ] Chat endpoint:", CONFIG.webhookUrl, "Client:", CONFIG.clientId, "Page:", location.href);
   if (!CONFIG.webhookUrl || CONFIG.webhookUrl.includes("PASTE_")) {
     warn("AssistQ backend is not configured — refresh the page and make sure the dashboard URL is correct.");
   }
