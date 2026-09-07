@@ -9,6 +9,7 @@ import { google } from "googleapis";
 import nodemailer from "nodemailer";
 import Razorpay from "razorpay";
 import { initDB, readStore, writeStore, flushPendingWrites, getDBPool } from "./db.js";
+import { ASSISTQ_INTEGRATION_SOURCES, defaultIntegrationState, normaliseExternalLead } from "./integrations_v8.js";
 
 dotenv.config();
 const __dirname=path.dirname(fileURLToPath(import.meta.url));
@@ -54,7 +55,7 @@ function ensureStoreShape(s){
   // client that doesn't have its own config yet — never edit it directly.
   s.realEstate.automationByClient=s.realEstate.automationByClient||{};
   s.realEstate.roundRobin=s.realEstate.roundRobin||{};
- s.clients=s.clients||defaultStore.clients; s.clientProfiles=s.clientProfiles||{}; s.keywords=s.keywords||[]; s.leads=s.leads||[]; s.conversations=s.conversations||{}; s.utm=s.utm||{}; s.gsc=s.gsc||defaultStore.gsc; s.gsc.byClient=s.gsc.byClient||{}; s.ga4=s.ga4||defaultStore.ga4; s.ga4.byClient=s.ga4.byClient||{}; s.google=s.google||defaultStore.google; s.google.byClient=s.google.byClient||{}; s.seoAudits=s.seoAudits||{}; s.reportHistory=s.reportHistory||[]; s.security=s.security||{adminPasswordHash:null}; s.whatsappThreads=s.whatsappThreads||{};
+ s.clients=s.clients||defaultStore.clients; s.clientProfiles=s.clientProfiles||{}; s.keywords=s.keywords||[]; s.leads=s.leads||[]; s.conversations=s.conversations||{}; s.utm=s.utm||{}; s.gsc=s.gsc||defaultStore.gsc; s.gsc.byClient=s.gsc.byClient||{}; s.ga4=s.ga4||defaultStore.ga4; s.ga4.byClient=s.ga4.byClient||{}; s.google=s.google||defaultStore.google; s.google.byClient=s.google.byClient||{}; s.seoAudits=s.seoAudits||{}; s.reportHistory=s.reportHistory||[]; s.security=s.security||{adminPasswordHash:null}; s.whatsappThreads=s.whatsappThreads||{}; s.integrationsByClient=s.integrationsByClient||{}; s.integrationsByClientMeta=s.integrationsByClientMeta||{};
   s.clients=s.clients.map(c=>({...c,accessCode:c.accessCode||crypto.randomBytes(4).toString("hex").toUpperCase(),plan:c.plan||"Starter",subscriptionStatus:c.subscriptionStatus||"active",subscriptionStart:c.subscriptionStart||null,subscriptionEnd:c.subscriptionEnd||null,landingPageFile:normaliseLandingPageFile(c.landingPageFile)||null,appsScriptWebhookUrl:String(c.appsScriptWebhookUrl||"").trim(),googleSpreadsheetId:String(c.googleSpreadsheetId||"").trim(),webhookSecret:String(c.webhookSecret||"").trim()}));
   s.leads=s.leads.map(l=>({...l,pipelineStage:l.pipelineStage||"NEW",assignedTo:l.assignedTo||null,notes:l.notes||"",responseMinutes:l.responseMinutes??null,updatedAt:l.updatedAt||l.date||new Date().toISOString()}));
   return s;
@@ -135,7 +136,7 @@ configureSessions();
 // different origin, so it must be excluded from X-Frame-Options/SAMEORIGIN
 // or every client embed would be silently blocked by the browser. Every
 // other route (dashboard, admin pages, APIs) keeps the SAMEORIGIN protection.
-app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");if(req.path!=="/widget.html")res.setHeader("X-Frame-Options","SAMEORIGIN");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(), microphone=(), geolocation=()");next();});
+app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-DNS-Prefetch-Control","off");res.setHeader("X-Download-Options","noopen");res.setHeader("X-Permitted-Cross-Domain-Policies","none");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(), microphone=(), geolocation=()");if(req.path!=="/widget.html")res.setHeader("X-Frame-Options","SAMEORIGIN");next();});
 const rateBuckets=new Map();
 function rateLimit(key,limit=30,windowMs=60000){return (req,res,next)=>{const now=Date.now(),ip=req.ip||req.socket.remoteAddress||"unknown",k=key+"|"+ip;const a=rateBuckets.get(k)||[];const fresh=a.filter(t=>now-t<windowMs);if(fresh.length>=limit)return res.status(429).json({error:"Too many requests. Please try again shortly."});fresh.push(now);rateBuckets.set(k,fresh);next();};}
 setInterval(()=>{const now=Date.now();for(const [k,a] of rateBuckets)if(!a.some(t=>now-t<60000))rateBuckets.delete(k);},60000);
@@ -238,10 +239,12 @@ function clientSettings(s,id){
   };
 }
 function planHasFeature(plan, feature) {
-  // feature: "visits", "documents", "testimonials" (Growth+); "team",
-  // "automation", "commissions", "possession" (Premium only)
+  // feature: "visits", "documents", "testimonials", "multiportal", "leadscoring",
+  // "territoryrouting", "seo" (Growth+); "team", "automation", "commissions",
+  // "possession" (Premium only). Starter gets chatbot + single-portal + basic
+  // dashboard only — see PLAN_FEATURE_CATALOG above for the full matrix.
   if (plan === "premium") return true;
-  if (plan === "growth") return ["visits", "documents", "testimonials"].includes(feature);
+  if (plan === "growth") return ["visits", "documents", "testimonials", "multiportal", "leadscoring", "territoryrouting", "seo"].includes(feature);
   return false; // starter
 }
 // ---------- Authentication / client-scope middleware ----------
@@ -334,6 +337,8 @@ function statusFor(score,settings={}){const hot=Number(settings.hotThreshold||80
 function scoreBreakdown(fields={},messages=[],settings={}){const w={...defaultScoring,...(settings.scoring||{})};const out={};for(const key of ["name","phone","email","purpose","location","configuration","budget","timeline"])out[key]=fieldPoints(w[key],fields[key]);out.engagement=messages.length>=6?(Number(w.engagement)||0):0;return out;}
 function normaliseFields(f={}){return {name:String(f.name||"").trim(),phone:String(f.phone||"").trim(),email:String(f.email||"").trim(),purpose:String(f.purpose||"").trim(),location:String(f.location||"").trim(),configuration:String(f.configuration||"").trim(),budget:String(f.budget||"").trim(),timeline:String(f.timeline||"").trim()};}
 function cleanUTM(u={}){return {source:String(u.source||u.utm_source||"").trim(),medium:String(u.medium||u.utm_medium||"").trim(),campaign:String(u.campaign||u.utm_campaign||"").trim()};}
+app.use((req,res,next)=>{if(req.path==="/api/auth/login"||req.path==="/api/auth/status"||req.path==="/api/auth/logout")return next();return requireCsrf(req,res,next);});
+
 function requireWebhookSecret(req,res,next){
   const secret=String(process.env.WEBHOOK_SECRET||"").trim();
   if(secret && req.headers["x-assistq-secret"]!==secret)return res.status(401).json({error:"Invalid webhook secret"});
@@ -343,16 +348,19 @@ function requireWebhookSecret(req,res,next){
 function whatsappUrl(phone,message="",clientId=""){const digits=String(phone||"").replace(/\D/g,"");if(!digits)return "";const s=ensureStoreShape(readStore());const c=s.clients.find(x=>x.id===normaliseClientId(clientId||""));const cc=String(c?.whatsappCountryCode||s.settings.whatsappCountryCode||"91");const full=digits.length===10?cc+digits:digits;return `https://wa.me/${full}?text=${encodeURIComponent(message)}`;}
 
 // ---------- Auth ----------
-app.get("/api/auth/status",(req,res)=>res.json({authenticated:!!req.session.user,user:req.session.user||null,googleConnected:!!req.session.tokens,googleEmail:req.session.googleEmail||null}));
+app.get("/api/auth/status",(req,res)=>res.json({authenticated:!!req.session.user,user:req.session.user||null,googleConnected:!!req.session.tokens,googleEmail:req.session.googleEmail||null,csrfToken:req.session.user?csrfToken(req):null}));
 app.post("/api/auth/login",rateLimit("login",10,60000),(req,res)=>{
   const email=String(req.body.email||"").trim().toLowerCase();const password=String(req.body.password||"");
   const adminEmail=String(process.env.ADMIN_EMAIL||"admin@assistq.local").toLowerCase();
   const s=ensureStoreShape(readStore());
-  if(email===adminEmail&&checkAdminPassword(password,s)){req.session.user={role:"admin",email};return res.json({ok:true,user:req.session.user});}
+  if(email===adminEmail&&checkAdminPassword(password,s)){req.session.user={role:"admin",email};csrfToken(req);return res.json({ok:true,user:req.session.user,csrfToken:req.session.csrfToken});}
   const c=s.clients.find(x=>x.reportEmail?.toLowerCase()===email&&x.accessCode===password);
   if(c){const sub=subscriptionInfo(c);if(!sub.active)return res.status(403).json({error:`This client account is ${sub.status}. Please contact ASSISTQ to renew the subscription.`,subscription:sub});
-    if(String(c.plan||"Starter").toLowerCase().trim()==="starter")return res.status(403).json({error:"Your Starter plan doesn't include dashboard access — your leads are sent to you directly by WhatsApp/email. Upgrade to Growth or Premium to unlock the dashboard.",plan:c.plan});
-    req.session.user={role:"client",email,clientId:c.id,name:c.name};return res.json({ok:true,user:req.session.user});}
+    // Starter now gets a scoped dashboard (lead list, status, basic settings) —
+    // see PLAN_FEATURES.starter on the frontend for exactly which pages that is.
+    // Everything beyond that scope is still enforced server-side per-endpoint
+    // via planHasFeature(), not just hidden in the nav.
+    req.session.user={role:"client",email,clientId:c.id,name:c.name};csrfToken(req);return res.json({ok:true,user:req.session.user,csrfToken:req.session.csrfToken});}
   // Individual salesperson login — separate from the one shared client
   // login above. This is what makes "who actually did this" possible for
   // any client with a real team: each rep gets their own credentials,
@@ -364,8 +372,8 @@ app.post("/api/auth/login",rateLimit("login",10,60000),(req,res)=>{
       if(rep.active===false)return res.status(403).json({error:"This salesperson account has been deactivated. Contact your admin."});
       const sub=subscriptionInfo(client);if(!sub.active)return res.status(403).json({error:`This account is ${sub.status}. Please contact your admin.`,subscription:sub});
       if(!planHasFeature(clientPlanTier(s,client.id),"team"))return res.status(403).json({error:"Individual salesperson logins require the Premium plan."});
-      req.session.user={role:"staff",email,clientId:client.id,repId:rep.id,name:rep.name};
-      return res.json({ok:true,user:req.session.user});
+      req.session.user={role:"staff",email,clientId:client.id,repId:rep.id,name:rep.name};csrfToken(req);
+      return res.json({ok:true,user:req.session.user,csrfToken:req.session.csrfToken});
     }
   }
   res.status(401).json({error:"Invalid email or password"});
@@ -434,6 +442,15 @@ app.get("/landing/:clientId",rateLimit("public-landing",120,60000),(req,res)=>{
 });
 
 // Public, non-secret client configuration for embeddable chatbot.
+app.get("/api/public/plans",rateLimit("public-plans",60,60000),(req,res)=>{
+  const s=ensureStoreShape(readStore());
+  const out=Object.entries(PLAN_CATALOG).map(([key,plan])=>{
+    const offer=foundationOfferStatus(s,key);
+    return {key,label:plan.label,monthly:plan.monthly,setup:plan.setup,foundationOffer:offer.active?{discountedSetup:offer.discountedSetup,remainingSlots:offer.remaining,maxSlots:offer.maxClients}:null};
+  });
+  res.json({plans:out});
+});
+
 app.get("/api/public/client-config",rateLimit("public-config",120,60000),(req,res)=>{const s=ensureStoreShape(readStore());const id=normaliseClientId(req.query.clientId||s.settings.clientId);const c=s.clients.find(x=>x.id===id);if(!c)return res.status(404).json({error:"Client not found"});const sub=subscriptionInfo(c);if(!sub.active)return res.status(403).json({error:`Client subscription is ${sub.status}.`,subscription:sub});const profile=s.clientProfiles[id]||{};const cs=clientSettings(s,id);res.setHeader("Cache-Control","no-store");res.json({clientId:id,businessName:c.name,website:c.website,clientWhatsApp:cs.clientWhatsApp||"",whatsappCountryCode:cs.whatsappCountryCode||"91",subscription:sub,assistant:profile.assistant||cs.assistant||defaultStore.settings.assistant,customLeadFields:profile.customLeadFields||cs.customLeadFields||[]});});
 
 // ---------- Billing (Razorpay) ----------
@@ -441,10 +458,67 @@ app.get("/api/public/client-config",rateLimit("public-config",120,60000),(req,re
 // source of truth for what each plan actually costs — the checkout page
 // only ever tells us WHICH plan the customer picked, never the amount.
 const PLAN_CATALOG = {
-  starter: { razorpayPlanEnv: "RAZORPAY_PLAN_STARTER", setup: 1999, monthly: 999, trial: true, label: "Starter" },
-  growth: { razorpayPlanEnv: "RAZORPAY_PLAN_GROWTH", setup: 2999, monthly: 3499, trial: false, label: "Growth" },
-  premium: { razorpayPlanEnv: "RAZORPAY_PLAN_PREMIUM", setup: 4999, monthly: 6999, trial: false, label: "Premium" }
+  starter: { razorpayPlanEnv: "RAZORPAY_PLAN_STARTER", setup: 2299, monthly: 2999, trial: true, label: "Starter" },
+  growth: { razorpayPlanEnv: "RAZORPAY_PLAN_GROWTH", setup: 3999, monthly: 6999, trial: false, label: "Growth" },
+  premium: { razorpayPlanEnv: "RAZORPAY_PLAN_PREMIUM", setup: 4499, monthly: 11999, trial: false, label: "Premium" }
 };
+// Foundation Offer — a launch discount to land the first few real clients on
+// each plan while there's no track record/case studies yet. 50% off the
+// one-time setup fee only; the monthly price is unchanged (that's what has
+// to be sustainable long-term). Auto-expires per plan once maxClients real
+// clients are on that plan — no manual toggling needed, and once slots run
+// out, checkout silently reverts to the normal setup fee above.
+const FOUNDATION_OFFER = { discountPercent: 15, maxClients: 5 };
+function foundationOfferStatus(s, planKey) {
+  const plan = PLAN_CATALOG[planKey];
+  if (!plan) return { active: false, remaining: 0, discountedSetup: null };
+  const label = plan.label.toLowerCase();
+  const existing = (s.clients || []).filter(c => String(c.plan || "Starter").toLowerCase().trim() === label).length;
+  const remaining = Math.max(0, FOUNDATION_OFFER.maxClients - existing);
+  const discountedSetup = Math.round(plan.setup * (1 - FOUNDATION_OFFER.discountPercent / 100));
+  return { active: remaining > 0, remaining, discountedSetup, normalSetup: plan.setup, maxClients: FOUNDATION_OFFER.maxClients };
+}
+// Single source of truth for "what does this plan actually include" — powers
+// both the client-facing My Plan page (/api/state -> planMatrix) and stays
+// next to PLAN_CATALOG so price and feature list never drift apart silently.
+// key = internal feature flag also understood by planHasFeature(); tiers =
+// the lowest plan tier that unlocks it, in starter < growth < premium order.
+const PLAN_FEATURE_CATALOG = [
+  { key: "chatbot", label: "AI WhatsApp/website lead responder", tier: "starter" },
+  { key: "singleportal", label: "One property portal connected (email/CSV import)", tier: "starter" },
+  { key: "dashboard", label: "Lead list, status tracking & basic dashboard", tier: "starter" },
+  { key: "manualfollowup", label: "Manual follow-up queue", tier: "starter" },
+  { key: "monthlyreport", label: "Monthly summary report", tier: "starter" },
+  { key: "multiportal", label: "Multi-portal hub (99acres, MagicBricks, Housing.com, NoBroker)", tier: "growth" },
+  { key: "visits", label: "Site visit scheduling", tier: "growth" },
+  { key: "documents", label: "Document vault", tier: "growth" },
+  { key: "testimonials", label: "Testimonials collection", tier: "growth" },
+  { key: "leadscoring", label: "Lead scoring & health monitoring", tier: "growth" },
+  { key: "territoryrouting", label: "Territory / area-based lead routing", tier: "growth" },
+  { key: "seo", label: "SEO audit, Search Console & GA4 sync", tier: "growth" },
+  { key: "weeklyreport", label: "Weekly reports", tier: "growth" },
+  { key: "automation", label: "Automated WhatsApp follow-up sequences", tier: "premium" },
+  { key: "team", label: "Individual staff/salesperson logins", tier: "premium" },
+  { key: "commissions", label: "Commission tracking", tier: "premium" },
+  { key: "possession", label: "Post-sale possession tracker", tier: "premium" },
+  { key: "voice", label: "AI Voice Receptionist (coming soon — not yet available on any plan)", tier: "unreleased" }
+];
+const PLAN_ORDER = ["starter", "growth", "premium"];
+function buildPlanMatrix(currentTier, s) {
+  const idx = PLAN_ORDER.indexOf(currentTier);
+  const offer = s ? foundationOfferStatus(s, currentTier) : { active: false };
+  return {
+    currentPlan: PLAN_CATALOG[currentTier]?.label || "Starter",
+    monthly: PLAN_CATALOG[currentTier]?.monthly ?? null,
+    setup: PLAN_CATALOG[currentTier]?.setup ?? null,
+    foundationOffer: offer.active ? { discountedSetup: offer.discountedSetup, remainingSlots: offer.remaining, maxSlots: offer.maxClients } : null,
+    features: PLAN_FEATURE_CATALOG.map(f => ({
+      key: f.key, label: f.label,
+      included: f.tier !== "unreleased" && PLAN_ORDER.indexOf(f.tier) <= idx,
+      requiresPlan: f.tier === "unreleased" ? null : (PLAN_CATALOG[f.tier]?.label || f.tier)
+    }))
+  };
+}
 const WEBSITE_CHARGE = 2999;
 const TRIAL_DAYS = 15;
 const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET }) : null;
@@ -466,7 +540,10 @@ app.post("/api/billing/create-subscription", rateLimit("billing-create", 20, 600
   const isTrial = !!plan.trial; // only Starter is ever a trial — this is decided by the plan, not the browser
 
   try {
-    const addons = [{ item: { name: `${plan.label} — one-time setup`, amount: plan.setup * 100, currency: "INR" } }];
+    const s = ensureStoreShape(readStore());
+    const offer = foundationOfferStatus(s, planKey);
+    const effectiveSetup = offer.active ? offer.discountedSetup : plan.setup;
+    const addons = [{ item: { name: `${plan.label} — one-time setup${offer.active ? " (Foundation Offer — 50% off)" : ""}`, amount: effectiveSetup * 100, currency: "INR" } }];
     if (noWebsite) addons.push({ item: { name: "Landing page (no existing website)", amount: WEBSITE_CHARGE * 100, currency: "INR" } });
 
     const subPayload = {
@@ -525,7 +602,7 @@ app.post("/api/billing/verify", rateLimit("billing-verify", 20, 60000), async (r
       if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
         const transporter = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: Number(process.env.SMTP_PORT || 587) === 465, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } });
         const loginUrl = process.env.APP_BASE_URL || "https://app.assistq.in";
-        const dashboardLine = plan.label === "Starter" ? "Your plan doesn't include dashboard access — your leads will be sent to you directly by WhatsApp and email." : `You can log in to your dashboard any time at <a href="${loginUrl}">${loginUrl}</a>.`;
+        const dashboardLine = `You can log in to your dashboard any time at <a href="${loginUrl}">${loginUrl}</a>. Your ${plan.label} plan includes ${plan.label === "Starter" ? "lead list, status tracking and a basic dashboard" : plan.label === "Growth" ? "the full lead hub, multi-portal integration, site visits, documents and SEO reporting" : "every feature, including staff logins, automation and commission tracking"} — see the My Plan page in your dashboard for the full list.`;
         await transporter.sendMail({
           from: process.env.REPORT_FROM || process.env.SMTP_USER, to: c.reportEmail,
           subject: `Welcome to AssistQ — your ${plan.label} plan is live`,
@@ -596,7 +673,7 @@ app.get("/api/state",requireAuth,(req,res)=>{
   const filter=x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId);
   const client=clientSettings(s,clientId);
   if(req.session.user.role!=="admin" && !client.subscription.active)return res.status(403).json({error:`Client subscription is ${client.subscription.status}. Please contact ASSISTQ to renew.`,subscription:client.subscription});
-  const profile=s.clientProfiles[clientId]||{assistant:client.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||[]};const gscClient=s.gsc.byClient[clientId]||s.gsc;const gaClient=s.ga4.byClient[clientId]||s.ga4;const out={settings:client,clientId,clients:(req.session.user.role==="admin"?s.clients:s.clients.filter(c=>c.id===clientId)).map(c=>clientRecordForResponse(c,req.session.user.role==="admin")),leads:s.leads.filter(filter).filter(x=>!x.mergedInto),conversations:Object.fromEntries(Object.entries(s.conversations).filter(([,x])=>filter(x))),keywords:s.keywords.filter(x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId)),utm:Object.fromEntries(Object.entries(s.utm||{}).filter(([k])=>String(k).startsWith(clientId+"|"))),gsc:gscClient,ga4:gaClient,seo:s.seoAudits[clientId]||null,reportHistory:s.reportHistory.filter(x=>x.clientId===clientId),profile,googleConnected:!!googleConnection(s,clientId)?.tokens,googleEmail:googleConnection(s,clientId)?.email||null,user:req.session.user};
+  const profile=s.clientProfiles[clientId]||{assistant:client.assistant||defaultStore.settings.assistant,customLeadFields:client.customLeadFields||[]};const gscClient=s.gsc.byClient[clientId]||s.gsc;const gaClient=s.ga4.byClient[clientId]||s.ga4;const out={settings:client,clientId,clients:(req.session.user.role==="admin"?s.clients:s.clients.filter(c=>c.id===clientId)).map(c=>clientRecordForResponse(c,req.session.user.role==="admin")),leads:s.leads.filter(filter).filter(x=>!x.mergedInto),conversations:Object.fromEntries(Object.entries(s.conversations).filter(([,x])=>filter(x))),keywords:s.keywords.filter(x=>x.clientId===clientId||(!x.clientId&&clientId===s.settings.clientId)),utm:Object.fromEntries(Object.entries(s.utm||{}).filter(([k])=>String(k).startsWith(clientId+"|"))),gsc:gscClient,ga4:gaClient,seo:s.seoAudits[clientId]||null,reportHistory:s.reportHistory.filter(x=>x.clientId===clientId),profile,googleConnected:!!googleConnection(s,clientId)?.tokens,googleEmail:googleConnection(s,clientId)?.email||null,user:req.session.user,planMatrix:buildPlanMatrix(clientPlanTier(s,clientId),s)};
   writeStore(s);res.json(out);
 });
 
@@ -1072,6 +1149,34 @@ app.post("/api/realestate/leads/:id/merge",requireAuth,(req,res)=>{
 app.post("/api/bridge/conversation",rateLimit("conversation",120,60000),requireActiveClient,(req,res)=>{try{res.json({ok:true,conversation:saveConversationEvent(req.body||{})});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/bridge/lead",rateLimit("lead",60,60000),requireActiveClient,(req,res)=>{try{const s=readStore();const c=req.body.conversationId?s.conversations[req.body.conversationId]:null;const body={...req.body,fields:normaliseFields(req.body.fields||c?.fields||{}),messages:Array.isArray(req.body.messages)?req.body.messages:(c?.messages||[]),utm:req.body.utm||c?.utm||{}};res.status(201).json({ok:true,lead:saveLeadInternal(body)});}catch(e){res.status(500).json({error:e.message});}});
 
+
+// ---------- Unified Lead Source Hub (v8) ----------
+function integrationConfig(s,clientId){
+  const x=s.integrationsByClient[clientId]||{};
+  return {enabled:{...defaultIntegrationState(),...(x.enabled||{})},createdAt:x.createdAt||null,updatedAt:x.updatedAt||null,publicWebhookToken:x.publicWebhookToken||null,portalConfigs:x.portalConfigs||{},sourceStats:x.sourceStats||{}};
+}
+function safeIntegrationResponse(s,clientId){
+  const x=integrationConfig(s,clientId);
+  return {sources:ASSISTQ_INTEGRATION_SOURCES,enabled:x.enabled,updatedAt:x.updatedAt,webhookPath:`/api/inbound/${encodeURIComponent(clientId)}`,webhookConfigured:!!x.publicWebhookToken,portalConfigs:x.portalConfigs||{},sourceStats:x.sourceStats||{}};
+}
+app.get('/api/integrations',requireAuth,(req,res)=>{try{requireOwner(req);const s=ensureStoreShape(readStore()),id=reClient(req,s);const out=safeIntegrationResponse(s,id); out.webhookToken=integrationConfig(s,id).publicWebhookToken; res.json(out);}catch(e){res.status(403).json({error:e.message});}});
+app.post('/api/integrations',requireAuth,(req,res)=>{try{requireOwner(req);const s=ensureStoreShape(readStore()),id=reClient(req,s);const old=integrationConfig(s,id);const enabled={...old.enabled};for(const key of Object.keys(enabled))if(req.body.enabled&&Object.prototype.hasOwnProperty.call(req.body.enabled,key))enabled[key]=!!req.body.enabled[key];let token=old.publicWebhookToken;if(!token)token=crypto.randomBytes(24).toString('hex');s.integrationsByClient[id]={...old,enabled,publicWebhookToken:token,portalConfigs:old.portalConfigs||{},sourceStats:old.sourceStats||{},createdAt:old.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString()};writeStore(s);const out=safeIntegrationResponse(s,id); out.webhookToken=token; res.json(out);}catch(e){res.status(403).json({error:e.message});}});
+app.post('/api/integrations/regenerate-webhook',requireAuth,(req,res)=>{try{requireOwner(req);const s=ensureStoreShape(readStore()),id=reClient(req,s);const x=integrationConfig(s,id);x.publicWebhookToken=crypto.randomBytes(24).toString('hex');x.updatedAt=new Date().toISOString();s.integrationsByClient[id]=x;writeStore(s);res.json({ok:true,webhookPath:`/api/inbound/${encodeURIComponent(id)}`,webhookToken:x.publicWebhookToken});}catch(e){res.status(403).json({error:e.message});}});
+app.post('/api/integrations/portal',requireAuth,(req,res)=>{try{requireOwner(req);const s=ensureStoreShape(readStore()),id=reClient(req,s);const portal=String(req.body.portal||'').toLowerCase();if(!['99acres','magicbricks','housing','nobroker','other'].includes(portal))return res.status(400).json({error:'Unsupported portal'});const method=String(req.body.method||'webhook').toLowerCase();if(!['direct','webhook','email','csv'].includes(method))return res.status(400).json({error:'Unsupported connection method'});const x=integrationConfig(s,id);x.portalConfigs=x.portalConfigs||{};
+  // Starter is limited to one connected portal (matches the pricing page:
+  // "one property portal via email/CSV import"). Growth+ unlocks the full
+  // multi-portal hub. Editing an already-connected portal is always allowed;
+  // this only blocks adding a *second, different* portal on Starter.
+  if(req.session.user?.role!=='admin'&&!planHasFeature(clientPlanTier(s,id),'multiportal')){
+    const already=Object.keys(x.portalConfigs||{});
+    if(already.length>=1&&!already.includes(portal))return res.status(403).json({error:'Your Starter plan includes one connected property portal. Upgrade to Growth to connect 99acres, MagicBricks, Housing.com and NoBroker together.'});
+  }x.portalConfigs[portal]={method,listingAccount:String(req.body.listingAccount||'').slice(0,200),endpoint:String(req.body.endpoint||'').slice(0,500),email:String(req.body.email||'').slice(0,200),status:String(req.body.status||'configured'),updatedAt:new Date().toISOString()};x.enabled.portal=true;x.updatedAt=new Date().toISOString();s.integrationsByClient[id]=x;writeStore(s);res.json(safeIntegrationResponse(s,id));}catch(e){res.status(403).json({error:e.message});}});
+app.post('/api/leads/import-rows',requireAuth,rateLimit('lead-import',10,60000),(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const rows=Array.isArray(req.body.rows)?req.body.rows:[];if(!rows.length)return res.status(400).json({error:'No rows supplied.'});if(rows.length>500)return res.status(400).json({error:'Maximum 500 leads per import.'});let created=0,skipped=0,errors=[];for(let i=0;i<rows.length;i++){const r=rows[i]||{};if(!r.name&&!r.phone&&!r.email){skipped++;continue;}try{saveLeadInternal({...r,clientId:id,utm_source:r.source||r.utm_source||'Property Portal / CSV',utm_medium:r.medium||'portal',fields:{...(r.fields||{}),location:r.location||r.area||'',budget:r.budget||'',name:r.name||'',phone:r.phone||'',email:r.email||''}});created++;}catch(e){errors.push({row:i+2,error:e.message});}}res.status(201).json({ok:true,created,skipped,errors});}catch(e){res.status(403).json({error:e.message});}});
+// Universal source endpoint. Each client has its own token, so leads can never silently land in another client.
+app.post('/api/inbound/:clientId',rateLimit('unified-inbound',180,60000),(req,res)=>{try{const s=ensureStoreShape(readStore());const id=normaliseClientId(req.params.clientId);const c=s.clients.find(x=>x.id===id);if(!c)return res.status(404).json({error:'Client not found'});const x=integrationConfig(s,id);const supplied=String(req.headers['x-assistq-token']||req.query.token||req.body?.assistqToken||'');if(!x.publicWebhookToken||supplied!==x.publicWebhookToken)return res.status(401).json({error:'Invalid AssistQ integration token'});const source=String(req.body?.source||req.query.source||'Custom Webhook').trim()||'Custom Webhook';const mapped=normaliseExternalLead(req.body,source);if(!mapped.name&&!mapped.phone&&!mapped.email)return res.status(400).json({error:'Lead needs at least a name, phone or email.'});const lead=saveLeadInternal({...mapped,clientId:id,source:mapped.utm_source||source});res.status(201).json({ok:true,leadId:lead.id,status:lead.status,assignedTo:lead.assignedTo||null});}catch(e){res.status(500).json({error:e.message});}});
+// Manual/offline lead entry uses the exact same scoring, duplicate detection, territory assignment and follow-up path.
+app.post('/api/leads/manual',requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const body={...req.body,clientId:id,utm_source:req.body.source||'Offline / Manual',medium:'offline'};if(!body.name&&!body.phone&&!body.email)return res.status(400).json({error:'Enter at least a name, phone or email.'});const lead=saveLeadInternal(body);res.status(201).json({ok:true,lead:enrichLead(lead,s)});}catch(e){res.status(403).json({error:e.message});}});
+
 // ---------- Keywords ----------
 app.post("/api/keywords",requireAuth,(req,res)=>{const s=ensureStoreShape(readStore());const clientId=selectedClient(req,s);if(req.session.user.role!=="admin"&&req.session.user.clientId!==clientId)return res.status(403).json({error:"Workspace access denied"});const keyword=String(req.body.keyword||"").trim();if(!keyword)return res.status(400).json({error:"Keyword required"});const x={id:"kw_"+crypto.randomBytes(4).toString("hex"),clientId,keyword,targetUrl:String(req.body.targetUrl||""),priority:String(req.body.priority||"Medium"),intent:String(req.body.intent||"Commercial")};s.keywords.push(x);writeStore(s);res.status(201).json(x);});
 app.delete("/api/keywords/:id",requireAuth,(req,res)=>{const s=ensureStoreShape(readStore());s.keywords=s.keywords.filter(x=>x.id!==req.params.id);writeStore(s);res.json({ok:true});});
@@ -1107,6 +1212,8 @@ function activity(s,clientId,type,text,meta={},actor=null){
 }
 function enrichLead(l,s){const visits=s.realEstate.visits.filter(v=>v.clientId===l.clientId&&v.leadId===l.id);const f=s.realEstate.followups.filter(v=>v.clientId===l.clientId&&v.leadId===l.id);const team=s.realEstate.team.find(t=>t.clientId===l.clientId&&t.id===l.assignedTo);return {...l,visits,followups:f,assignedUser:team||null};}
 function leadById(s,id,clientId){return s.leads.find(x=>x.id===id&&x.clientId===clientId);}
+app.get('/api/realestate/lead-health',requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const leads=s.leads.filter(x=>x.clientId===id&&!x.mergedInto);const now=Date.now();const open=leads.filter(l=>l.pipelineStage==='NEW');const over10=open.filter(l=>now-new Date(l.date||now).getTime()>10*60000);const over30=open.filter(l=>now-new Date(l.date||now).getTime()>30*60000);const avg=leads.filter(l=>l.responseMinutes!=null&&Number(l.responseMinutes)>0);res.json({total:leads.length,newLeads:open.length,over10m:over10.length,over30m:over30.length,avgResponseMinutes:avg.length?Math.round(avg.reduce((a,l)=>a+Number(l.responseMinutes||0),0)/avg.length):null,hotWaiting:open.filter(l=>l.status==='HOT').length});}catch(e){res.status(403).json({error:e.message});}});
+app.post('/api/realestate/property-match',requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const lead=leadById(s,req.body.leadId,id);if(!lead)return res.status(404).json({error:'Lead not found'});const text=(String(lead.location||'')+' '+String(lead.requirement||'')).toLowerCase();const budgetNum=Number(String(lead.budget||'').replace(/[^0-9.]/g,''));const projects=s.realEstate.projects.filter(p=>p.clientId===id&&p.active!==false);const scored=projects.map(p=>{let score=0;const hay=(p.name+' '+p.location+' '+p.configurations+' '+p.description).toLowerCase();if(lead.location&&hay.includes(String(lead.location).toLowerCase()))score+=50;if(lead.requirement&&hay.includes(String(lead.requirement).toLowerCase()))score+=20;const pf=Number(String(p.priceFrom||'').replace(/[^0-9.]/g,''));const pt=Number(String(p.priceTo||'').replace(/[^0-9.]/g,''));if(budgetNum&&pf&&(!pt||budgetNum>=pf*0.8)&&(pt?budgetNum<=pt*1.2:true))score+=25;if(text.split(/\s+/).some(w=>w.length>3&&hay.includes(w)))score+=5;return {...p,matchScore:Math.min(100,score)};}).sort((a,b)=>b.matchScore-a.matchScore).slice(0,10);res.json({leadId:lead.id,matches:scored});}catch(e){res.status(403).json({error:e.message});}});
 app.get("/api/realestate/summary",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const leads=s.leads.filter(x=>x.clientId===id);const visits=s.realEstate.visits.filter(x=>x.clientId===id);const team=s.realEstate.team.filter(x=>x.clientId===id);const bookings=leads.filter(x=>x.pipelineStage==="BOOKING").length;const qualified=leads.filter(x=>x.score>=50).length;const contacted=leads.filter(x=>["CONTACTED","INTERESTED","SITE_VISIT_SCHEDULED","SITE_VISIT_COMPLETED","NEGOTIATION","BOOKING"].includes(x.pipelineStage)).length;const scheduled=visits.filter(x=>x.status==="scheduled").length;const completed=visits.filter(x=>x.status==="completed").length;const negotiation=leads.filter(x=>x.pipelineStage==="NEGOTIATION").length;const bySource={};for(const l of leads){const key=l.source||"Direct";bySource[key]??={leads:0,qualified:0,visits:0,bookings:0};bySource[key].leads++;if(l.score>=50)bySource[key].qualified++;if(visits.some(v=>v.leadId===l.id&&v.status==="completed"))bySource[key].visits++;if(l.pipelineStage==="BOOKING")bySource[key].bookings++;}res.json({clientId:id,counts:{leads:leads.length,qualified,contacted,scheduled,completed,negotiation,bookings},bySource,team:team.map(t=>{const tl=leads.filter(l=>l.assignedTo===t.id);return {...t,leads:tl.length,contacted:tl.filter(l=>l.pipelineStage!=="NEW").length,visits:visits.filter(v=>v.assignedTo===t.id&&v.status==="completed").length,bookings:tl.filter(l=>l.pipelineStage==="BOOKING").length,responseMinutes:tl.length?Math.round(tl.reduce((a,l)=>a+(l.responseMinutes||0),0)/tl.filter(l=>l.responseMinutes!=null).length||0):0};})});}catch(e){res.status(e.message.includes("access")?403:500).json({error:e.message});}});
 app.get("/api/realestate/leads",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s);const repId=staffScope(req);res.json(s.leads.filter(x=>x.clientId===id&&!x.mergedInto&&(!repId||x.assignedTo===repId)).map(l=>enrichLead(l,s)));}catch(e){res.status(403).json({error:e.message});}});
 app.patch("/api/realestate/leads/:id",requireAuth,(req,res)=>{try{const s=ensureStoreShape(readStore()),id=reClient(req,s),l=leadById(s,req.params.id,id);if(!l)return res.status(404).json({error:"Lead not found"});const repId=staffScope(req);if(repId&&l.assignedTo!==repId)return res.status(403).json({error:"This lead isn't assigned to you."});const actor=actorName(req);const allowedStage=["NEW","QUALIFIED","CONTACTED","INTERESTED","SITE_VISIT_SCHEDULED","SITE_VISIT_COMPLETED","NEGOTIATION","BOOKING","LOST"];if(req.body.pipelineStage&&allowedStage.includes(req.body.pipelineStage)){const wasBooking=l.pipelineStage==="BOOKING";l.pipelineStage=req.body.pipelineStage;activity(s,id,"stage",`${l.name} moved to ${l.pipelineStage}`,{leadId:l.id},actor);
@@ -1259,7 +1366,7 @@ app.delete("/api/realestate/testimonials/:id",requireAuth,(req,res)=>{try{const 
 app.get("/api/public/testimonials",rateLimit("public-testimonials",120,60000),(req,res)=>{try{const s=ensureStoreShape(readStore());const id=normaliseClientId(req.query.clientId||"");res.setHeader("Cache-Control","no-store");res.json(s.realEstate.testimonials.filter(x=>x.clientId===id&&x.approved).slice(0,20).map(x=>({name:x.name,rating:x.rating,text:x.text})));}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/realestate/rera-check",requireAuth,async(req,res)=>{try{const id=reClient(req,ensureStoreShape(readStore()));const url=String(req.body.url||"").trim();const text=String(req.body.text||"");let html="";if(url){const r=await fetchText(url,8000);html=r.text||"";}const source=(text+"\n"+html);const hasRera=/MahaRERA|MAHARERA|RERA/i.test(source);const hasNumber=/\bP\d{9,}\b/i.test(source);const hasQr=/QR\s*code|qr-code|qrcode/i.test(source);const hasWebsite=/https?:\/\//i.test(source);const checks=[{name:"MahaRERA registration reference",ok:hasRera||hasNumber,detail:hasRera||hasNumber?"Registration reference detected.":"No obvious MahaRERA registration reference detected."},{name:"QR code reference",ok:hasQr,detail:hasQr?"QR-code reference detected; verify the actual rendered QR code is legible.":"No QR-code reference detected."},{name:"Website address",ok:hasWebsite,detail:hasWebsite?"Website address detected.":"No website URL detected."}];res.json({clientId:id,score:Math.round(checks.filter(x=>x.ok).length/checks.length*100),checks,disclaimer:"Marketing-material QA only. Verify current MahaRERA requirements before publishing; this is not legal advice or a compliance guarantee."});}catch(e){res.status(403).json({error:e.message});}});
 
-app.get("/api/health",(req,res)=>res.json({ok:true,service:"ASSISTQ Growth Platform",version:"v8",time:new Date().toISOString()}));
+app.get("/api/health",(req,res)=>res.json({ok:true,service:"ASSISTQ Growth Platform",version:"v10-real-estate-growth",time:new Date().toISOString()}));
 
 // Deployment readiness checks. These verify configuration without exposing secrets.
 app.get("/api/deployment/check",requireAdmin,(req,res)=>{const checks=[
